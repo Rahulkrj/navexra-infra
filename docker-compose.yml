@@ -1,0 +1,149 @@
+# ─────────────────────────────────────────────
+#  Resource plan  (2 vCPU / 8 GB total)
+#  ─────────────────────────────────────────────
+#  Existing services (assumed): ~1 vCPU / 3 GB
+#  PostgreSQL:  0.6 vCPU / 2 GB
+#  Redis:       0.3 vCPU / 512 MB
+#  OS + Nginx:  ~0.1 vCPU / headroom
+# ─────────────────────────────────────────────
+#
+# Notes:
+#  * `version:` key is intentionally omitted (obsolete in Compose v2).
+#  * `deploy.resources.limits` is honored by `docker compose up` in
+#    Compose v2.x (no Swarm required). Verify with `docker compose version`.
+#  * Ports are bound to 127.0.0.1 only — DBs are NOT publicly reachable.
+#  * Required env vars use the `${VAR:?msg}` form so `up` fails fast if unset.
+
+networks:
+  db_net:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  redis_data:
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+services:
+
+  # ───────────────────────────────────────────
+  #  PostgreSQL  — light footprint
+  # ───────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    container_name: postgres
+    restart: unless-stopped
+    networks:
+      - db_net
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:?POSTGRES_USER is required}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+      POSTGRES_DB: ${POSTGRES_DB:?POSTGRES_DB is required}
+      # Keep data in a sub-dir of the volume mount (best-practice for perms / future bind mounts).
+      PGDATA: /var/lib/postgresql/data/pgdata
+    shm_size: "256mb"
+    stop_grace_period: 1m
+    logging: *default-logging
+    deploy:
+      resources:
+        limits:
+          cpus: "0.6"
+          memory: 2048M
+        reservations:
+          cpus: "0.1"
+          memory: 512M
+    command: >
+      postgres
+        -c max_connections=50
+        -c shared_buffers=512MB
+        -c effective_cache_size=1536MB
+        -c maintenance_work_mem=128MB
+        -c work_mem=8MB
+        -c wal_buffers=16MB
+        -c min_wal_size=512MB
+        -c max_wal_size=2GB
+        -c checkpoint_completion_target=0.9
+        -c default_statistics_target=100
+        -c random_page_cost=1.1
+        -c effective_io_concurrency=200
+        -c max_worker_processes=2
+        -c max_parallel_workers=2
+        -c max_parallel_workers_per_gather=1
+        -c max_parallel_maintenance_workers=1
+        -c jit=off
+        -c track_io_timing=on
+        -c log_min_duration_statement=500
+        -c log_checkpoints=on
+        -c log_lock_waits=on
+        -c log_temp_files=0
+        -c log_autovacuum_min_duration=0
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  # ───────────────────────────────────────────
+  #  Redis  — minimal footprint
+  # ───────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: redis
+    restart: unless-stopped
+    networks:
+      - db_net
+    ports:
+      - "127.0.0.1:6379:6379"
+    volumes:
+      - redis_data:/data
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?REDIS_PASSWORD is required}
+    stop_grace_period: 30s
+    logging: *default-logging
+    deploy:
+      resources:
+        limits:
+          cpus: "0.3"
+          memory: 512M
+        reservations:
+          cpus: "0.05"
+          memory: 128M
+    # Use sh -c so we can interpolate the password from env at runtime
+    # (avoids baking the secret into `docker inspect`'s Cmd).
+    command: >
+      sh -c '
+      exec redis-server
+        --requirepass "$$REDIS_PASSWORD"
+        --maxmemory 350mb
+        --maxmemory-policy allkeys-lru
+        --save "900 1"
+        --save "300 10"
+        --save "60 10000"
+        --appendonly yes
+        --appendfsync everysec
+        --no-appendfsync-on-rewrite yes
+        --auto-aof-rewrite-percentage 100
+        --auto-aof-rewrite-min-size 32mb
+        --tcp-backlog 256
+        --tcp-keepalive 300
+        --hz 10
+        --aof-rewrite-incremental-fsync yes
+        --rdb-save-incremental-fsync yes
+        --protected-mode yes
+        --loglevel notice
+      '
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a \"$$REDIS_PASSWORD\" --no-auth-warning ping | grep -q PONG"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
