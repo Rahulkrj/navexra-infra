@@ -16,6 +16,7 @@
 
 networks:
   db_net:
+    name: infra_db_net
     driver: bridge
 
 volumes:

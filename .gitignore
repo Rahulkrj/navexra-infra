@@ -1,3 +1,4 @@
 .env
+.env.n8n
 *.local
 .DS_Store
