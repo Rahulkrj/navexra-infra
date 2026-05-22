@@ -34,7 +34,9 @@ services:
   #  PostgreSQL  — light footprint
   # ───────────────────────────────────────────
   postgres:
-    image: postgres:16-alpine
+    # Pin the major; Docker Hub auto-updates the minor (currently 18.4).
+    # For full reproducibility pin the minor too: postgres:18.4-alpine
+    image: postgres:18-alpine
     container_name: postgres
     restart: unless-stopped
     networks:
@@ -96,7 +98,11 @@ services:
   #  Redis  — minimal footprint
   # ───────────────────────────────────────────
   redis:
-    image: redis:7-alpine
+    # Pin the major; Docker Hub auto-updates the minor (currently 8.6.x).
+    # For full reproducibility pin the minor too: redis:8.6-alpine
+    # Note: Redis >= 7.4 is dual SSPL/RSALv2 licensed (Redis 8 also offers AGPLv3).
+    # If you need a BSD-licensed drop-in instead, swap this image for valkey/valkey:8-alpine.
+    image: redis:8-alpine
     container_name: redis
     restart: unless-stopped
     networks:
