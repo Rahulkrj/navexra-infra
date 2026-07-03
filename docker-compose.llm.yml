@@ -1,0 +1,292 @@
+# ─────────────────────────────────────────────
+#  Personal LLM Gateway — OpenAI-compatible, subscription-backed
+#  Resource plan (within the existing 2 vCPU / 8 GB budget):
+#    litellm        : 0.5 vCPU / 1 GB     (always on)
+#    claude-wrapper : 0.4 vCPU / 768 MB   (always on)
+#    codex-adapter  : 0.3 vCPU / 384 MB   (always on — ChatGPT subscription)
+#    cursor-adapter : 0.2 vCPU / 256 MB   (profile: cursor)
+#    ollama         : ~1.0 vCPU / 4 GB    (profile: local — see notes)
+# ─────────────────────────────────────────────
+#
+# Bring up the core stack (LiteLLM + Claude + ChatGPT/Codex) with:
+#   docker compose -f docker-compose.llm.yml --env-file .env.llm up -d
+#
+# Add the Cursor backend:
+#   docker compose -f docker-compose.llm.yml --env-file .env.llm --profile cursor up -d
+#
+# Add a local/offline model (Ollama):
+#   docker compose -f docker-compose.llm.yml --env-file .env.llm --profile local up -d
+#
+# Requires:
+#   * Postgres reachable on hostname `postgres` inside the external docker
+#     network `infra_db_net` (created by ./docker-compose.yml).
+#   * A dedicated `litellm` DB + role provisioned in that postgres instance
+#     (see docs/ADD_LLM.md).
+#
+# Notes:
+#   * Ports are bound to 127.0.0.1 only — nothing here is publicly reachable.
+#     The host nginx terminates TLS and reverse-proxies llm.infra.<domain>
+#     to 127.0.0.1:4000 (LiteLLM). See docs/ADD_LLM.md.
+#   * `version:` key is intentionally omitted (obsolete in Compose v2).
+#   * `deploy.resources.limits` is honored by `docker compose up` in
+#     Compose v2.x (no Swarm required).
+
+# Distinct project name so this stack doesn't see the DB stack's containers
+# as orphans (both compose files live in the same directory).
+name: navexra-llm
+
+networks:
+  db_net:
+    name: infra_db_net
+    external: true
+
+volumes:
+  # Persists the Claude Code subscription credentials (~/.claude) so the
+  # wrapper survives restarts without re-authenticating.
+  claude_config:
+  # Persists the ChatGPT subscription credentials ($CODEX_HOME/auth.json) so
+  # the codex-adapter survives restarts without re-authenticating.
+  codex_config:
+  ollama_data:
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+services:
+
+  # ───────────────────────────────────────────
+  #  LiteLLM — OpenAI-compatible front door / router
+  # ───────────────────────────────────────────
+  litellm:
+    # Pin a known-good tag; bump deliberately.
+    image: ghcr.io/berriai/litellm:main-stable
+    container_name: litellm
+    restart: unless-stopped
+    networks:
+      - db_net
+    ports:
+      - "127.0.0.1:4000:4000"
+    volumes:
+      - ./llm/litellm-config.yaml:/app/config.yaml:ro
+    environment:
+      LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY:?LITELLM_MASTER_KEY is required}
+      # Optional: a key used to sign/secure the admin UI session.
+      LITELLM_SALT_KEY: ${LITELLM_SALT_KEY:-${LITELLM_MASTER_KEY}}
+      # Persists virtual keys, spend logs and model config in Postgres.
+      DATABASE_URL: postgresql://${LLM_DB_USER:?LLM_DB_USER is required}:${LLM_DB_PASSWORD:?LLM_DB_PASSWORD is required}@postgres:5432/${LLM_DB_NAME:?LLM_DB_NAME is required}
+      STORE_MODEL_IN_DB: "true"
+      # Backend bearer keys referenced by litellm-config.yaml via os.environ/*
+      CLAUDE_WRAPPER_API_KEY: ${CLAUDE_WRAPPER_API_KEY:?CLAUDE_WRAPPER_API_KEY is required}
+      CODEX_ADAPTER_API_KEY: ${CODEX_ADAPTER_API_KEY:?CODEX_ADAPTER_API_KEY is required}
+      CURSOR_ADAPTER_API_KEY: ${CURSOR_ADAPTER_API_KEY:-unused}
+    command: ["--config", "/app/config.yaml", "--port", "4000"]
+    depends_on:
+      claude-wrapper:
+        condition: service_healthy
+      codex-adapter:
+        condition: service_healthy
+    stop_grace_period: 30s
+    logging: *default-logging
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          # LiteLLM + Prisma needs ~600 MB+ at startup; 256M gets OOM-killed (exit 137).
+          memory: 1024M
+        reservations:
+          cpus: "0.05"
+          memory: 256M
+    healthcheck:
+      # The litellm image has no wget; use its python instead.
+      test: ["CMD", "python", "-c", "import urllib.request as u; u.urlopen('http://127.0.0.1:4000/health/liveliness', timeout=4)"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  # ───────────────────────────────────────────
+  #  claude-wrapper — Claude Code CLI behind an OpenAI-compatible API
+  #  Source: https://github.com/RichardAtCT/claude-code-openai-wrapper
+  #  Uses your Claude Pro/Max subscription via CLAUDE_CODE_OAUTH_TOKEN.
+  # ───────────────────────────────────────────
+  claude-wrapper:
+    build:
+      # Builds straight from the upstream repo. For reproducibility, pin a
+      # commit by appending it, e.g. ...wrapper.git#<commit-sha>
+      context: https://github.com/RichardAtCT/claude-code-openai-wrapper.git#main
+    image: claude-code-openai-wrapper:local
+    container_name: claude-wrapper
+    restart: unless-stopped
+    networks:
+      - db_net
+    ports:
+      # Exposed on loopback for local debugging / smoke tests only.
+      - "127.0.0.1:8000:8000"
+    volumes:
+      - claude_config:/root/.claude
+    environment:
+      PORT: "8000"
+      # Subscription (no per-token billing). Mint with `claude setup-token`
+      # on a machine with a browser; valid ~1 year. See docs/ADD_LLM.md.
+      CLAUDE_CODE_OAUTH_TOKEN: ${CLAUDE_CODE_OAUTH_TOKEN:?CLAUDE_CODE_OAUTH_TOKEN is required}
+      CLAUDE_AUTH_METHOD: cli
+      # Protect the endpoint so only LiteLLM (with this bearer) can call it.
+      API_KEY: ${CLAUDE_WRAPPER_API_KEY:?CLAUDE_WRAPPER_API_KEY is required}
+      API_KEYS: ${CLAUDE_WRAPPER_API_KEY}
+      # Run Claude Code in an isolated temp workspace (default), never the app dir.
+      MAX_TIMEOUT: "600000"
+      RATE_LIMIT_ENABLED: "false"
+    stop_grace_period: 30s
+    logging: *default-logging
+    deploy:
+      resources:
+        limits:
+          cpus: "0.4"
+          memory: 768M
+        reservations:
+          cpus: "0.05"
+          memory: 128M
+    healthcheck:
+      # The upstream image ships curl (not wget).
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8000/health >/dev/null 2>&1 || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 40s
+
+  # ───────────────────────────────────────────
+  #  codex-adapter — OpenAI Codex CLI behind an OpenAI-compatible API
+  #  Uses your ChatGPT Plus/Pro subscription via `codex login` credentials
+  #  persisted in the codex_config volume ($CODEX_HOME/auth.json).
+  #  One-time login (device-code flow, works headless):
+  #    docker compose -f docker-compose.llm.yml --env-file .env.llm \
+  #      run --rm codex-adapter codex login --device-auth
+  # ───────────────────────────────────────────
+  codex-adapter:
+    build:
+      context: ./llm/codex-adapter
+    image: codex-adapter:local
+    container_name: codex-adapter
+    restart: unless-stopped
+    networks:
+      - db_net
+    ports:
+      # Exposed on loopback for local debugging / smoke tests only.
+      - "127.0.0.1:8020:8020"
+    volumes:
+      - codex_config:/root/.codex
+    environment:
+      PORT: "8020"
+      # Bearer that LiteLLM must present to call this adapter.
+      ADAPTER_API_KEY: ${CODEX_ADAPTER_API_KEY:?CODEX_ADAPTER_API_KEY is required}
+      # Default model when a request doesn't specify one.
+      # Leave empty to use the Codex CLI's current default.
+      CODEX_MODEL: ${CODEX_MODEL:-}
+      # Optional: low | medium | high (trades speed for quality).
+      CODEX_REASONING_EFFORT: ${CODEX_REASONING_EFFORT:-low}
+      CODEX_TIMEOUT: "600"
+    stop_grace_period: 30s
+    logging: *default-logging
+    deploy:
+      resources:
+        limits:
+          cpus: "0.3"
+          memory: 384M
+        reservations:
+          cpus: "0.05"
+          memory: 96M
+    healthcheck:
+      # python:*-slim has no wget; curl is installed in the Dockerfile.
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8020/health >/dev/null 2>&1 || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  # ───────────────────────────────────────────
+  #  cursor-adapter — Cursor CLI (cursor-agent) behind an OpenAI-compatible API
+  #  Uses your Cursor Pro subscription via a User API key (CURSOR_API_KEY).
+  #  NOTE: cursor-agent is an agentic coding tool with file-write access; it is
+  #  best treated as an "agentic coding" model, not a general chat model.
+  #  Enabled only with: --profile cursor
+  # ───────────────────────────────────────────
+  cursor-adapter:
+    build:
+      context: ./llm/cursor-adapter
+    image: cursor-adapter:local
+    container_name: cursor-adapter
+    profiles: ["cursor"]
+    restart: unless-stopped
+    networks:
+      - db_net
+    ports:
+      - "127.0.0.1:8010:8010"
+    environment:
+      PORT: "8010"
+      # Mint at Cursor Dashboard → API Keys (officially supported headless path).
+      # Defaulted to empty (not `:?`) so the core stack still validates when the
+      # cursor profile is inactive; the adapter checks these at runtime.
+      CURSOR_API_KEY: ${CURSOR_API_KEY:-}
+      # Bearer that LiteLLM must present to call this adapter.
+      ADAPTER_API_KEY: ${CURSOR_ADAPTER_API_KEY:-}
+      # Default Cursor model used when a request does not specify one.
+      CURSOR_MODEL: ${CURSOR_MODEL:-composer-2.5}
+      CURSOR_TIMEOUT: "600"
+    stop_grace_period: 30s
+    logging: *default-logging
+    deploy:
+      resources:
+        limits:
+          cpus: "0.2"
+          memory: 256M
+        reservations:
+          cpus: "0.05"
+          memory: 64M
+    healthcheck:
+      # python:*-slim has no wget; curl is installed in the Dockerfile.
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8010/health >/dev/null 2>&1 || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  # ───────────────────────────────────────────
+  #  ollama — local / offline models (OPTIONAL)
+  #  WARNING: this 2 vCPU / 8 GB box can only run tiny CPU models (e.g.
+  #  qwen2.5:3b, llama3.2:3b) and they will be slow. For anything serious,
+  #  run Ollama on a larger / GPU host and point LiteLLM at it instead.
+  #  Enabled only with: --profile local
+  # ───────────────────────────────────────────
+  ollama:
+    image: ollama/ollama:latest
+    container_name: ollama
+    profiles: ["local"]
+    restart: unless-stopped
+    networks:
+      - db_net
+    ports:
+      - "127.0.0.1:11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    environment:
+      OLLAMA_KEEP_ALIVE: "5m"
+      OLLAMA_MAX_LOADED_MODELS: "1"
+    stop_grace_period: 30s
+    logging: *default-logging
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 4096M
+        reservations:
+          cpus: "0.1"
+          memory: 256M
+    healthcheck:
+      test: ["CMD-SHELL", "ollama list >/dev/null 2>&1 || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 30s

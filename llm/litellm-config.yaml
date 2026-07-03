@@ -1,0 +1,95 @@
+# LiteLLM proxy config — the single OpenAI-compatible router.
+#
+# Each entry under `model_list` is a public `model` name your clients (n8n,
+# apps) send. LiteLLM forwards it to the matching backend `api_base`.
+#
+# To call a model, POST to https://llm.infra.<domain>/v1/chat/completions
+# with `Authorization: Bearer <litellm-virtual-key>` and `"model": "<model_name>"`.
+#
+# IMPORTANT: the underlying model IDs after `openai/` must be ones the Claude
+# wrapper actually advertises. Confirm with:
+#   curl -H "Authorization: Bearer $CLAUDE_WRAPPER_API_KEY" \
+#        http://127.0.0.1:8000/v1/models
+# and adjust the values below if your wrapper version differs.
+
+model_list:
+  # ── Claude (Pro/Max subscription via claude-code-openai-wrapper) ──
+  - model_name: claude-sonnet
+    litellm_params:
+      model: openai/claude-sonnet-4-6
+      api_base: http://claude-wrapper:8000/v1
+      api_key: os.environ/CLAUDE_WRAPPER_API_KEY
+    model_info:
+      mode: chat
+
+  - model_name: claude-opus
+    litellm_params:
+      model: openai/claude-opus-4-6
+      api_base: http://claude-wrapper:8000/v1
+      api_key: os.environ/CLAUDE_WRAPPER_API_KEY
+    model_info:
+      mode: chat
+
+  - model_name: claude-haiku
+    litellm_params:
+      model: openai/claude-haiku-4-5-20251001
+      api_base: http://claude-wrapper:8000/v1
+      api_key: os.environ/CLAUDE_WRAPPER_API_KEY
+    model_info:
+      mode: chat
+
+  # ── ChatGPT (Plus/Pro subscription via codex-adapter) ──
+  # "default" lets the Codex CLI pick its current default model, so this keeps
+  # working across OpenAI model deprecations. To pin a specific model, set
+  # CODEX_MODEL in .env.llm, or add another entry with e.g. openai/gpt-5.4.
+  - model_name: chatgpt
+    litellm_params:
+      model: openai/default
+      api_base: http://codex-adapter:8020/v1
+      api_key: os.environ/CODEX_ADAPTER_API_KEY
+    model_info:
+      mode: chat
+
+  # Same backend under a gpt-* alias for clients that expect one.
+  - model_name: gpt-codex
+    litellm_params:
+      model: openai/default
+      api_base: http://codex-adapter:8020/v1
+      api_key: os.environ/CODEX_ADAPTER_API_KEY
+    model_info:
+      mode: chat
+
+  # ── Cursor (Individual/Pro subscription via cursor-adapter) — requires --profile cursor ──
+  # Agentic coding model (file-write capable inside its throwaway workdir);
+  # treat as a coding model, not a general chat model.
+  - model_name: cursor-composer
+    litellm_params:
+      model: openai/composer-2.5
+      api_base: http://cursor-adapter:8010/v1
+      api_key: os.environ/CURSOR_ADAPTER_API_KEY
+    model_info:
+      mode: chat
+
+  # ── Local / offline (Ollama) — requires --profile local ──
+  # Tiny CPU models only on this box. Pull the model first:
+  #   docker compose -f docker-compose.llm.yml exec ollama ollama pull qwen2.5:3b
+  # - model_name: local-qwen
+  #   litellm_params:
+  #     model: ollama/qwen2.5:3b
+  #     api_base: http://ollama:11434
+  #   model_info:
+  #     mode: chat
+
+litellm_settings:
+  # Silently drop OpenAI params a backend doesn't support instead of erroring.
+  drop_params: true
+  num_retries: 2
+  request_timeout: 600
+  # Set a friendly default so clients that omit `model` still work.
+  # default_fallbacks: ["claude-sonnet"]
+
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY
+  database_url: os.environ/DATABASE_URL
+  # Keep the admin UI / management endpoints behind the master key.
+  store_model_in_db: true
