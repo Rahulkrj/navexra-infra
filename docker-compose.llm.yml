@@ -1,7 +1,7 @@
 # ─────────────────────────────────────────────
 #  Personal LLM Gateway — OpenAI-compatible, subscription-backed
 #  Resource plan (within the existing 2 vCPU / 8 GB budget):
-#    litellm        : 0.5 vCPU / 1 GB     (always on)
+#    litellm        : 1.0 vCPU / 2 GB     (always on; startup peak — idles ~250 MB)
 #    claude-wrapper : 0.4 vCPU / 768 MB   (always on)
 #    codex-adapter  : 0.3 vCPU / 384 MB   (always on — ChatGPT subscription)
 #    cursor-adapter : 0.2 vCPU / 256 MB   (profile: cursor)
@@ -93,9 +93,10 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.5"
-          # LiteLLM + Prisma needs ~600 MB+ at startup; 256M gets OOM-killed (exit 137).
-          memory: 1024M
+          cpus: "1.0"
+          # LiteLLM + Prisma peaks >1 GB during startup (observed ~1.05 GB RSS
+          # OOM-killed at 1024M on linux/amd64). Steady-state is ~250 MB.
+          memory: 2048M
         reservations:
           cpus: "0.05"
           memory: 256M
