@@ -4,9 +4,10 @@
 #   ./scripts/bootstrap-db.sh
 #
 # Creates:
-#   * litellm  role + DB  (password from .env.llm LLM_DB_PASSWORD) — LiteLLM gateway
-#   * merchant role + DB merchant_api (password: merchant)          — your app
-#     -> DATABASE_URL=postgresql://merchant:merchant@localhost:5432/merchant_api
+#   * litellm role + DB (credentials from .env.llm LLM_DB_USER/PASSWORD/NAME)
+#     — used by the LiteLLM gateway for virtual keys and spend logs.
+# Re-running is safe: the role password is re-asserted from .env.llm
+# (rotate by editing .env.llm, re-running, then restarting litellm).
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -16,10 +17,6 @@ cd "$(dirname "$0")/.."
 LLM_DB_USER="$(grep -E '^LLM_DB_USER=' .env.llm | cut -d= -f2-)"
 LLM_DB_PASSWORD="$(grep -E '^LLM_DB_PASSWORD=' .env.llm | cut -d= -f2-)"
 LLM_DB_NAME="$(grep -E '^LLM_DB_NAME=' .env.llm | cut -d= -f2-)"
-
-MERCHANT_USER="merchant"
-MERCHANT_PASSWORD="merchant"
-MERCHANT_DB="merchant_api"
 
 echo "==> Ensuring postgres is up..."
 docker compose up -d postgres
@@ -49,11 +46,8 @@ SQL
 }
 
 create_role_and_db "$LLM_DB_USER" "$LLM_DB_PASSWORD" "$LLM_DB_NAME"
-create_role_and_db "$MERCHANT_USER" "$MERCHANT_PASSWORD" "$MERCHANT_DB"
 
-echo "==> Verifying connections as each role..."
+echo "==> Verifying connection..."
 docker compose exec -T -e PGPASSWORD="$LLM_DB_PASSWORD" postgres psql -h 127.0.0.1 -U "$LLM_DB_USER" -d "$LLM_DB_NAME" -c '\conninfo'
-docker compose exec -T -e PGPASSWORD="$MERCHANT_PASSWORD" postgres psql -h 127.0.0.1 -U "$MERCHANT_USER" -d "$MERCHANT_DB" -c '\conninfo'
 
-echo "OK: databases ready."
-echo "    app DATABASE_URL: postgresql://merchant:merchant@localhost:5432/merchant_api"
+echo "OK: litellm database ready."

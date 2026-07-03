@@ -20,12 +20,22 @@ hdr "Containers"
 docker compose ps --format 'table {{.Name}}\t{{.Status}}' 2>/dev/null
 docker compose -f docker-compose.llm.yml --env-file .env.llm ps --format 'table {{.Name}}\t{{.Status}}' 2>/dev/null
 
-hdr "Postgres (merchant_api)"
+hdr "Postgres (litellm DB)"
+LLM_DB_USER="$(grep -E '^LLM_DB_USER=' .env.llm | cut -d= -f2-)"
+LLM_DB_PASSWORD="$(grep -E '^LLM_DB_PASSWORD=' .env.llm | cut -d= -f2-)"
+LLM_DB_NAME="$(grep -E '^LLM_DB_NAME=' .env.llm | cut -d= -f2-)"
+if docker compose exec -T -e PGPASSWORD="$LLM_DB_PASSWORD" postgres \
+     psql -h 127.0.0.1 -U "$LLM_DB_USER" -d "$LLM_DB_NAME" -tAc 'SELECT 1' 2>/dev/null | grep -q 1; then
+  ok "litellm can connect to $LLM_DB_NAME"
+else
+  bad "litellm DB connection (run ./scripts/bootstrap-db.sh)"
+fi
+# App DB (merchant_api) is managed outside bootstrap-db.sh — soft check only.
 if docker compose exec -T -e PGPASSWORD=merchant postgres \
-     psql -h 127.0.0.1 -U merchant -d merchant_api -tAc 'SELECT 1' | grep -q 1; then
+     psql -h 127.0.0.1 -U merchant -d merchant_api -tAc 'SELECT 1' 2>/dev/null | grep -q 1; then
   ok "merchant can connect to merchant_api"
 else
-  bad "merchant/merchant_api connection (run ./scripts/bootstrap-db.sh)"
+  echo "  SKIP  merchant_api not present (create it if your app needs it)"
 fi
 
 hdr "claude-wrapper (127.0.0.1:8000)"

@@ -62,9 +62,12 @@ docker compose up -d
 ./scripts/bootstrap-db.sh
 ```
 
-Creates (idempotently): `litellm` DB for the gateway, and `merchant_api` for
-your app → `DATABASE_URL=postgresql://merchant:merchant@localhost:5432/merchant_api`
-(change this password before exposing anything beyond localhost).
+Creates (idempotently) the `litellm` role + DB for the gateway, using the
+credentials in `.env.llm`. Re-running is safe — it re-asserts the password
+from `.env.llm`, so rotating is: edit the file, re-run, restart litellm.
+
+App databases (e.g. `merchant_api`) are managed separately — create them
+with the direct `docker exec` SQL below or your own migrations.
 
 **Already have postgres/redis/n8n running?** Skip `docker compose up -d` —
 the gateway reuses the same Postgres instance, only *adding* the two
