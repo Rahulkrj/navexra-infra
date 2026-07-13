@@ -160,9 +160,12 @@ Open `https://n8n.infra.navexra.com` and complete the owner-setup wizard
 
 ## 6. Day-2 operations
 
-- **Upgrade**: bump the `image:` tag in `docker-compose.n8n.yml`, then
+- **Upgrade**: prefer `./scripts/upgrade-n8n.sh <version>` (backs up DB and
+keeps `n8nio/n8n` + `n8nio/runners` tags in sync). Manual: bump both image
+tags in `docker-compose.n8n.yml`, then
 `docker compose -f docker-compose.n8n.yml --env-file .env.n8n pull && docker compose -f docker-compose.n8n.yml --env-file .env.n8n up -d`.
-- **Tail logs**: `docker compose -f docker-compose.n8n.yml logs -f n8n`.
+- **Tail logs**: `docker compose -f docker-compose.n8n.yml logs -f n8n` (and
+`… logs -f task-runners` if Code nodes fail).
 - **Backup**: nightly `pg_dump n8n` on the `postgres` container covers
 workflows and credentials. The `n8n_data` volume only holds runtime
 scratch (binary-data references, encryption-key cache, etc.) but is

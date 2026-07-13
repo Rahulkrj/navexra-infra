@@ -8,12 +8,12 @@
 #
 # What it does:
 #   1. Backs up the n8n Postgres DB (and notes the data volume)
-#   2. Updates image: n8nio/n8n:<version> in docker-compose.n8n.yml
-#   3. pull + up -d, then waits for /healthz
+#   2. Updates n8nio/n8n:<version> and n8nio/runners:<version> in compose
+#   3. pull + up -d (n8n + task-runners), then waits for /healthz
 #
 # Recommended path from 1.117.0:
 #   1.117.0 → 1.123.65  (unlock Settings → Migration Report)
-#   fix Critical issues in the Migration Report
+#   add external runners + N8N_RUNNERS_AUTH_TOKEN (see docker-compose.n8n.yml)
 #   1.123.65 → 2.29.10  (current stable; use --confirm-major)
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -76,6 +76,11 @@ fi
 CURRENT="$(grep -E '^\s*image:\s*n8nio/n8n:' "$COMPOSE_FILE" | head -1 | sed -E 's/.*n8nio\/n8n:([^[:space:]]+).*/\1/')"
 [ -n "$CURRENT" ] || { echo "ERROR: could not parse current image tag from $COMPOSE_FILE"; exit 1; }
 
+HAS_RUNNERS=0
+if grep -qE '^\s*image:\s*n8nio/runners:' "$COMPOSE_FILE"; then
+  HAS_RUNNERS=1
+fi
+
 if [ "$CURRENT" = "$TARGET" ]; then
   echo "Already pinned to n8nio/n8n:$TARGET — nothing to do."
   exit 0
@@ -86,7 +91,18 @@ TARGET_MAJOR="${TARGET%%.*}"
 
 echo "==> Current pin : n8nio/n8n:$CURRENT"
 echo "==> Target pin  : n8nio/n8n:$TARGET"
+[ "$HAS_RUNNERS" -eq 1 ] && echo "==> Also bumping : n8nio/runners:$TARGET (keep in sync)"
 [ "$DRY_RUN" -eq 1 ] && echo "==> Mode         : dry-run (no changes)"
+
+# shellcheck disable=SC1090
+set -a
+# shellcheck source=/dev/null
+source "$ENV_FILE"
+set +a
+
+if [ "$HAS_RUNNERS" -eq 1 ]; then
+  : "${N8N_RUNNERS_AUTH_TOKEN:?N8N_RUNNERS_AUTH_TOKEN missing in $ENV_FILE (openssl rand -hex 32)}"
+fi
 
 if [ "$CURRENT_MAJOR" != "$TARGET_MAJOR" ]; then
   cat <<EOF
@@ -108,12 +124,6 @@ EOF
     exit 1
   fi
 fi
-
-# shellcheck disable=SC1090
-set -a
-# shellcheck source=/dev/null
-source "$ENV_FILE"
-set +a
 
 : "${N8N_DB_NAME:?N8N_DB_NAME missing in $ENV_FILE}"
 : "${N8N_DB_USER:?N8N_DB_USER missing in $ENV_FILE}"
@@ -162,20 +172,30 @@ echo "==> Note: also snapshot volume 'n8n_data' if you store binary data there:"
 echo "    docker run --rm -v n8n_data:/data -v \"$PWD/${BACKUP_DIR#./}\":/backup alpine \\"
 echo "      tar czf /backup/n8n_data-${stamp}.tgz -C /data ."
 
-echo "==> Updating $COMPOSE_FILE image tag..."
+echo "==> Updating $COMPOSE_FILE image tag(s)..."
 if [ "$DRY_RUN" -eq 1 ]; then
   echo "    (dry-run) would set image: n8nio/n8n:$TARGET"
+  [ "$HAS_RUNNERS" -eq 1 ] && echo "    (dry-run) would set image: n8nio/runners:$TARGET"
 else
   # Portable in-place edit (macOS + Linux)
   tmp="$(mktemp)"
-  sed -E "s|(image:[[:space:]]*n8nio/n8n:)[^[:space:]]+|\\1${TARGET}|" "$COMPOSE_FILE" > "$tmp"
+  sed -E \
+    -e "s|(image:[[:space:]]*n8nio/n8n:)[^[:space:]]+|\\1${TARGET}|" \
+    -e "s|(image:[[:space:]]*n8nio/runners:)[^[:space:]]+|\\1${TARGET}|" \
+    "$COMPOSE_FILE" > "$tmp"
   if ! grep -q "n8nio/n8n:${TARGET}" "$tmp"; then
-    echo "ERROR: failed to rewrite image tag"
+    echo "ERROR: failed to rewrite n8n image tag"
+    rm -f "$tmp"
+    exit 1
+  fi
+  if [ "$HAS_RUNNERS" -eq 1 ] && ! grep -q "n8nio/runners:${TARGET}" "$tmp"; then
+    echo "ERROR: failed to rewrite runners image tag"
     rm -f "$tmp"
     exit 1
   fi
   mv "$tmp" "$COMPOSE_FILE"
   echo "    pinned to n8nio/n8n:$TARGET"
+  [ "$HAS_RUNNERS" -eq 1 ] && echo "    pinned to n8nio/runners:$TARGET"
 fi
 
 echo "==> Validating compose..."
@@ -187,11 +207,17 @@ fi
 
 compose config >/dev/null
 
-echo "==> Pulling n8nio/n8n:$TARGET ..."
-compose pull n8n
-
-echo "==> Recreating n8n..."
-compose up -d n8n
+if [ "$HAS_RUNNERS" -eq 1 ]; then
+  echo "==> Pulling n8nio/n8n:$TARGET + n8nio/runners:$TARGET ..."
+  compose pull n8n task-runners
+  echo "==> Recreating n8n + task-runners..."
+  compose up -d n8n task-runners
+else
+  echo "==> Pulling n8nio/n8n:$TARGET ..."
+  compose pull n8n
+  echo "==> Recreating n8n..."
+  compose up -d n8n
+fi
 
 echo "==> Waiting for healthz..."
 ok=0

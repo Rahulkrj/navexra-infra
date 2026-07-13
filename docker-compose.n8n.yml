@@ -1,7 +1,8 @@
 # ─────────────────────────────────────────────
 #  n8n  — workflow automation (single-instance)
 #  Resource plan (within the existing 2 vCPU / 8 GB budget):
-#    n8n: 0.4 vCPU / 768 MB
+#    n8n:          0.4 vCPU / 768 MB
+#    task-runners: 0.2 vCPU / 384 MB  (Code node isolation; required for 2.x)
 # ─────────────────────────────────────────────
 #
 # Bring up with:
@@ -14,11 +15,14 @@
 #       CREATE USER n8n WITH PASSWORD '...';
 #       CREATE DATABASE n8n OWNER n8n;
 #       GRANT ALL PRIVILEGES ON DATABASE n8n TO n8n;
+#   * N8N_RUNNERS_AUTH_TOKEN in .env.n8n (openssl rand -hex 32)
 #
 # Notes:
 #   * Port is bound to 127.0.0.1 only — n8n is NOT publicly reachable.
 #     The host nginx terminates TLS and reverse-proxies n8n.infra.domainname.com
 #     to 127.0.0.1:5678.
+#   * Keep n8nio/n8n and n8nio/runners on the SAME tag.
+#     Prefer: ./scripts/upgrade-n8n.sh <version>
 #   * `version:` key is intentionally omitted (obsolete in Compose v2).
 #   * `deploy.resources.limits` is honored by `docker compose up` in
 #     Compose v2.x (no Swarm required).
@@ -38,7 +42,8 @@ services:
   # ───────────────────────────────────────────
   n8n:
     # Pin the minor; bump deliberately. Check https://hub.docker.com/r/n8nio/n8n/tags
-    image: n8nio/n8n:1.117.0
+    # Keep in sync with task-runners below (or use ./scripts/upgrade-n8n.sh).
+    image: n8nio/n8n:1.123.65
     container_name: n8n
     restart: unless-stopped
     networks:
@@ -65,8 +70,13 @@ services:
       N8N_SECURE_COOKIE: "true"
       # --- Security / data ---
       N8N_ENCRYPTION_KEY: ${N8N_ENCRYPTION_KEY:?N8N_ENCRYPTION_KEY is required}
-      N8N_RUNNERS_ENABLED: "true"
+      N8N_ENFORCE_SETTINGS_FILE_PERMISSIONS: "true"
       N8N_BLOCK_ENV_ACCESS_IN_NODE: "true"
+      # --- Task runners (external sidecar; required for Code nodes on 2.x) ---
+      N8N_RUNNERS_ENABLED: "true"
+      N8N_RUNNERS_MODE: external
+      N8N_RUNNERS_BROKER_LISTEN_ADDRESS: "0.0.0.0"
+      N8N_RUNNERS_AUTH_TOKEN: ${N8N_RUNNERS_AUTH_TOKEN:?N8N_RUNNERS_AUTH_TOKEN is required}
       # --- Misc ---
       GENERIC_TIMEZONE: ${N8N_TIMEZONE:-UTC}
       TZ: ${N8N_TIMEZONE:-UTC}
@@ -92,3 +102,34 @@ services:
       timeout: 5s
       retries: 5
       start_period: 60s
+
+  # ───────────────────────────────────────────
+  #  task-runners — Code node isolation (sidecar)
+  #  Image tag MUST match n8n above.
+  #  Docs: https://docs.n8n.io/hosting/configuration/task-runners/
+  # ───────────────────────────────────────────
+  task-runners:
+    image: n8nio/runners:1.123.65
+    container_name: n8n-runners
+    restart: unless-stopped
+    networks:
+      - db_net
+    environment:
+      N8N_RUNNERS_AUTH_TOKEN: ${N8N_RUNNERS_AUTH_TOKEN:?N8N_RUNNERS_AUTH_TOKEN is required}
+      N8N_RUNNERS_TASK_BROKER_URI: http://n8n:5679
+    depends_on:
+      - n8n
+    stop_grace_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    deploy:
+      resources:
+        limits:
+          cpus: "0.2"
+          memory: 384M
+        reservations:
+          cpus: "0.05"
+          memory: 64M
