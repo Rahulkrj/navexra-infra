@@ -43,7 +43,7 @@ services:
   n8n:
     # Pin the minor; bump deliberately. Check https://hub.docker.com/r/n8nio/n8n/tags
     # Keep in sync with task-runners below (or use ./scripts/upgrade-n8n.sh).
-    image: n8nio/n8n:1.123.65
+    image: n8nio/n8n:2.29.10
     container_name: n8n
     restart: unless-stopped
     networks:
@@ -109,7 +109,7 @@ services:
   #  Docs: https://docs.n8n.io/hosting/configuration/task-runners/
   # ───────────────────────────────────────────
   task-runners:
-    image: n8nio/runners:1.123.65
+    image: n8nio/runners:2.29.10
     container_name: n8n-runners
     restart: unless-stopped
     networks:
