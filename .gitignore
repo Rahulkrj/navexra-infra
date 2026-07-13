@@ -3,3 +3,4 @@
 .env.llm
 *.local
 .DS_Store
+backups/

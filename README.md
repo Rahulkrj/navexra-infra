@@ -140,24 +140,32 @@ configured subscription. All green = ready.
 
 ## 4. Using the API
 
-One OpenAI-compatible endpoint: `http://localhost:4000/v1`. Switch backends
-by model name:
+One OpenAI-compatible endpoint. Pick the base URL for where you're calling
+from:
 
-| model | backend |
-|---|---|
-| `claude-sonnet` / `claude-opus` / `claude-haiku` | Claude subscription |
-| `chatgpt` / `gpt-codex` | ChatGPT subscription |
-| `cursor-composer` | Cursor subscription (agentic coding) |
+| calling from                                    | base URL                             |
+| ----------------------------------------------- | ------------------------------------ |
+| anywhere on the internet (production)           | `https://llm.infra.navexra.com/v1`   |
+| the VPS itself / local machine                  | `http://localhost:4000/v1`           |
+| containers on `infra_db_net` (e.g. n8n)         | `http://litellm:4000/v1`             |
+
+Switch backends by model name:
+
+| model                                            | backend                              |
+| ------------------------------------------------ | ------------------------------------ |
+| `claude-sonnet` / `claude-opus` / `claude-haiku` | Claude subscription                  |
+| `chatgpt` / `gpt-codex`                          | ChatGPT subscription                 |
+| `cursor-composer`                                | Cursor subscription (agentic coding) |
 
 ```bash
-curl http://localhost:4000/v1/chat/completions \
+curl https://llm.infra.navexra.com/v1/chat/completions \
   -H "Authorization: Bearer <key>" -H "Content-Type: application/json" \
   -d '{"model":"claude-sonnet","messages":[{"role":"user","content":"Hi"}]}'
 ```
 
 ```python
 from openai import OpenAI
-client = OpenAI(base_url="http://localhost:4000/v1", api_key="<key>")
+client = OpenAI(base_url="https://llm.infra.navexra.com/v1", api_key="<key>")
 r = client.chat.completions.create(model="chatgpt",
         messages=[{"role": "user", "content": "Hi"}])
 print(r.choices[0].message.content)
@@ -167,22 +175,25 @@ print(r.choices[0].message.content)
 limited *virtual keys* (per-app models, rate limits, expiry, revocation):
 
 ```bash
-curl -X POST http://localhost:4000/key/generate \
+curl -X POST https://llm.infra.navexra.com/key/generate \
   -H "Authorization: Bearer <master-key>" -H "Content-Type: application/json" \
   -d '{"key_alias":"my-app","models":["claude-sonnet","chatgpt"],"duration":"90d"}'
 ```
 
-Admin UI: `http://localhost:4000/ui` (log in with the master key).
+Admin UI: `https://llm.infra.navexra.com/ui` (log in with the master key).
 
-From other containers on the `infra_db_net` network (e.g. n8n), use
-`http://litellm:4000/v1` as the base URL.
+In n8n, set the OpenAI credential's Base URL to `http://litellm:4000/v1`
+(same docker network) with a virtual key.
+
+**Full API reference** — every endpoint, streaming, key management, error
+codes: [docs/API_USAGE.md](docs/API_USAGE.md).
 
 **Adding / pinning models.** Edit `llm/litellm-config.yaml` (e.g. add an
 entry with `model: openai/claude-opus-4-5-20250929` or pin a GPT model),
 then `docker compose -f docker-compose.llm.yml --env-file .env.llm restart litellm`.
 The Claude wrapper's live model list: `curl -H "Authorization: Bearer $CLAUDE_WRAPPER_API_KEY" http://127.0.0.1:8000/v1/models`.
 
-## 5. Day-to-day operations
+## [lm.infra.navexra.com](http://lm.infra.navexra.com)5. Day-to-day operations
 
 ```bash
 # status / logs
@@ -205,28 +216,64 @@ docker compose -f docker-compose.llm.yml --env-file .env.llm --profile cursor do
 Identical to local, plus:
 
 1. Copy `.env` and `.env.llm` to the VPS manually (gitignored; the Claude
-   token and Cursor key travel inside `.env.llm`).
+  token and Cursor key travel inside `.env.llm`).
 2. If postgres/redis/n8n already run there, follow the "already have
-   postgres" path in section 2.2 — same instance, new databases only.
+  postgres" path in section 2.2 — same instance, new databases only.
 3. Run sections 2.4 and 2.5 (ChatGPT device login must be redone per
-   machine — it lives in a local docker volume), then `./scripts/smoke-test.sh`.
-4. Public TLS: point DNS at the VPS and configure host nginx to proxy
-   `llm.infra.<domain>` → `127.0.0.1:4000` — see `docs/ADD_LLM.md`.
+  machine — it lives in a local docker volume), then `./scripts/smoke-test.sh`.
+4. Public TLS: see section 6.1 below.
 5. Give apps virtual keys, never the master key. n8n on the same network
-   can use `http://litellm:4000/v1` directly.
+  can use `http://litellm:4000/v1` directly.
+
+### 6.1 Public HTTPS via host nginx + certbot
+
+1. **DNS**: add an A/AAAA record for `llm.infra.navexra.com` with the same
+  values as your other subdomains (`dig +short n8n.infra.navexra.com A AAAA`).
+   Wait until `dig +short llm.infra.navexra.com` answers.
+2. **Bootstrap vhost** (HTTP only; certbot adds TLS):
+  ```bash
+   cat > /etc/nginx/sites-available/llm.infra.navexra.com <<'EOF'
+   server {
+       listen 80;
+       listen [::]:80;
+       server_name llm.infra.navexra.com;
+       location /.well-known/acme-challenge/ { root /var/www/certbot; }
+       location / { return 301 https://$host$request_uri; }
+   }
+   EOF
+   ln -s /etc/nginx/sites-available/llm.infra.navexra.com /etc/nginx/sites-enabled/
+   nginx -t && systemctl reload nginx
+   certbot --nginx -d llm.infra.navexra.com
+  ```
+3. **Fix the 443 block.** Certbot reuses the port-80 block, leaving the
+  HTTPS server with `location / { return 301 ... }` — an infinite redirect
+   loop. In the 443 server block, replace that `location /` with the proxy
+   (keep all `# managed by Certbot` lines), and keep the ACME location in
+   the port-80 block for renewals:
+4. **Verify**:
+  ```bash
+   nginx -t && systemctl reload nginx
+   curl https://llm.infra.navexra.com/health/liveliness   # → "I'm alive!"
+  ```
+
+Apps then use `https://llm.infra.navexra.com/v1` as the OpenAI base URL with a
+virtual key. This also exposes the admin UI at `/ui` (protected by the
+master key login) — restrict it by IP in nginx if you prefer.
 
 ## 7. Troubleshooting
 
-| Symptom | Cause / fix |
-|---|---|
-| `postgres` restart-loop: "initialized by PostgreSQL version N" | Old data volume from a different major. Wipe it (`docker volume rm navexra-infra_postgres_data`) or pin the old image version. |
-| `litellm` exit code 137 | OOM-killed — memory limit too low (needs ~1 GB at startup). |
-| `litellm` "Invalid model name" after config edit | Container didn't reload the bind-mounted config — `restart litellm`. |
-| Adapter code changes not taking effect | Container still on the old image — rebuild with `--force-recreate`. |
-| `codex-adapter` 503 "not logged in" | Run the device login (section 2.5). |
-| `cursor-adapter` "Workspace Trust Required" | The adapter passes `--trust`; rebuild if you see this (old image). |
-| Claude 401 via gateway | Token expired/revoked or truncated — re-mint with `claude setup-token`, verify with `CLAUDE_CODE_OAUTH_TOKEN=<t> claude -p "say ok"`. |
-| Health shows `unhealthy` but service answers | Healthcheck binary missing in image — healthchecks here use curl/python for that reason. |
+
+| Symptom                                                        | Cause / fix                                                                                                                           |
+| -------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------- |
+| `postgres` restart-loop: "initialized by PostgreSQL version N" | Old data volume from a different major. Wipe it (`docker volume rm navexra-infra_postgres_data`) or pin the old image version.        |
+| `litellm` exit code 137                                        | OOM-killed — memory limit too low (needs ~1 GB at startup).                                                                           |
+| `litellm` "Invalid model name" after config edit               | Container didn't reload the bind-mounted config — `restart litellm`.                                                                  |
+| Adapter code changes not taking effect                         | Container still on the old image — rebuild with `--force-recreate`.                                                                   |
+| `codex-adapter` 503 "not logged in"                            | Run the device login (section 2.5).                                                                                                   |
+| `cursor-adapter` "Workspace Trust Required"                    | The adapter passes `--trust`; rebuild if you see this (old image).                                                                    |
+| Claude 401 via gateway                                         | Token expired/revoked or truncated — re-mint with `claude setup-token`, verify with `CLAUDE_CODE_OAUTH_TOKEN=<t> claude -p "say ok"`. |
+| Health shows `unhealthy` but service answers                   | Healthcheck binary missing in image — healthchecks here use curl/python for that reason.                                              |
+
 
 ## 8. Repo map
 
@@ -241,3 +288,4 @@ scripts/bootstrap-db.sh   create litellm + merchant_api DBs (idempotent)
 scripts/smoke-test.sh     end-to-end health + real completion tests
 docs/                     ADD_LLM.md, ADD_CHATGPT.md, ADD_N8N.md, ADD_NGINX.md
 ```
+
