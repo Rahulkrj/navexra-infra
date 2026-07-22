@@ -31,53 +31,46 @@ networks:
   db_net:
     name: infra_db_net
     external: true
+  dokploy-network:          # NEW — Traefik ingress lives here
+    external: true
 
 volumes:
   n8n_data:
 
 services:
 
-  # ───────────────────────────────────────────
-  #  n8n  — main process
-  # ───────────────────────────────────────────
   n8n:
-    # Pin the minor; bump deliberately. Check https://hub.docker.com/r/n8nio/n8n/tags
-    # Keep in sync with task-runners below (or use ./scripts/upgrade-n8n.sh).
     image: n8nio/n8n:2.29.10
     container_name: n8n
     restart: unless-stopped
     networks:
-      - db_net
-    ports:
-      - "127.0.0.1:5678:5678"
+      - db_net              # reaches postgres
+      - dokploy-network     # reachable by Traefik
+    expose:
+      - "5678"             # was: ports: 127.0.0.1:5678:5678  — removed
     volumes:
       - n8n_data:/home/node/.n8n
     environment:
-      # --- Database ---
       DB_TYPE: postgresdb
       DB_POSTGRESDB_HOST: postgres
       DB_POSTGRESDB_PORT: 5432
       DB_POSTGRESDB_DATABASE: ${N8N_DB_NAME:?N8N_DB_NAME is required}
       DB_POSTGRESDB_USER: ${N8N_DB_USER:?N8N_DB_USER is required}
       DB_POSTGRESDB_PASSWORD: ${N8N_DB_PASSWORD:?N8N_DB_PASSWORD is required}
-      # --- Public URL / reverse-proxy awareness ---
-      N8N_HOST: ${N8N_HOST:?N8N_HOST is required}
+      N8N_HOST: ${N8N_HOST:?N8N_HOST is required}        # e.g. n8n.infra.navexra.com
       N8N_PORT: 5678
       N8N_PROTOCOL: https
       N8N_EDITOR_BASE_URL: https://${N8N_HOST}/
       WEBHOOK_URL: https://${N8N_HOST}/
-      N8N_PROXY_HOPS: 1
+      N8N_PROXY_HOPS: 1                                   # still 1 — Traefik is the single hop
       N8N_SECURE_COOKIE: "true"
-      # --- Security / data ---
       N8N_ENCRYPTION_KEY: ${N8N_ENCRYPTION_KEY:?N8N_ENCRYPTION_KEY is required}
       N8N_ENFORCE_SETTINGS_FILE_PERMISSIONS: "true"
       N8N_BLOCK_ENV_ACCESS_IN_NODE: "true"
-      # --- Task runners (external sidecar; required for Code nodes on 2.x) ---
       N8N_RUNNERS_ENABLED: "true"
       N8N_RUNNERS_MODE: external
       N8N_RUNNERS_BROKER_LISTEN_ADDRESS: "0.0.0.0"
       N8N_RUNNERS_AUTH_TOKEN: ${N8N_RUNNERS_AUTH_TOKEN:?N8N_RUNNERS_AUTH_TOKEN is required}
-      # --- Misc ---
       GENERIC_TIMEZONE: ${N8N_TIMEZONE:-UTC}
       TZ: ${N8N_TIMEZONE:-UTC}
       N8N_DIAGNOSTICS_ENABLED: "false"
@@ -85,17 +78,11 @@ services:
     stop_grace_period: 30s
     logging:
       driver: json-file
-      options:
-        max-size: "10m"
-        max-file: "3"
+      options: { max-size: "10m", max-file: "3" }
     deploy:
       resources:
-        limits:
-          cpus: "0.4"
-          memory: 768M
-        reservations:
-          cpus: "0.05"
-          memory: 128M
+        limits: { cpus: "0.4", memory: 768M }
+        reservations: { cpus: "0.05", memory: 128M }
     healthcheck:
       test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:5678/healthz | grep -q ok || exit 1"]
       interval: 30s
@@ -103,17 +90,12 @@ services:
       retries: 5
       start_period: 60s
 
-  # ───────────────────────────────────────────
-  #  task-runners — Code node isolation (sidecar)
-  #  Image tag MUST match n8n above.
-  #  Docs: https://docs.n8n.io/hosting/configuration/task-runners/
-  # ───────────────────────────────────────────
   task-runners:
     image: n8nio/runners:2.29.10
     container_name: n8n-runners
     restart: unless-stopped
     networks:
-      - db_net
+      - dokploy-network     # only needs to reach n8n's broker; shares this net with n8n
     environment:
       N8N_RUNNERS_AUTH_TOKEN: ${N8N_RUNNERS_AUTH_TOKEN:?N8N_RUNNERS_AUTH_TOKEN is required}
       N8N_RUNNERS_TASK_BROKER_URI: http://n8n:5679
@@ -122,14 +104,8 @@ services:
     stop_grace_period: 30s
     logging:
       driver: json-file
-      options:
-        max-size: "10m"
-        max-file: "3"
+      options: { max-size: "10m", max-file: "3" }
     deploy:
       resources:
-        limits:
-          cpus: "0.2"
-          memory: 384M
-        reservations:
-          cpus: "0.05"
-          memory: 64M
+        limits: { cpus: "0.2", memory: 384M }
+        reservations: { cpus: "0.05", memory: 64M }

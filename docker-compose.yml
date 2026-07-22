@@ -18,10 +18,13 @@ networks:
   db_net:
     name: infra_db_net
     driver: bridge
+  dokploy-network:
+    external: true
 
 volumes:
   postgres_data:
   redis_data:
+  mongo_data:
 
 x-logging: &default-logging
   driver: json-file
@@ -154,3 +157,41 @@ services:
       timeout: 5s
       retries: 5
       start_period: 10s
+
+  # ───────────────────────────────────────────
+  #  MongoDB — Ubuntu-based (no alpine variant)
+  # ───────────────────────────────────────────
+  mongodb:
+    image: mongo:8.0.26          # 8.0.28 not published; 8.0.26 is current. Use mongo:8.0 to track patches.
+    container_name: mongodb
+    restart: unless-stopped
+    networks:
+      - db_net
+    ports:
+      - "127.0.0.1:27017:27017"
+    volumes:
+      - mongo_data:/data/db
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: ${MONGO_USER:?MONGO_USER is required}
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_PASSWORD:?MONGO_PASSWORD is required}
+      MONGO_INITDB_DATABASE: ${MONGO_DB:?MONGO_DB is required}
+    stop_grace_period: 1m
+    logging: *default-logging
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 2048M
+        reservations:
+          cpus: "0.05"
+          memory: 256M
+    # Cap WiredTiger cache explicitly — see the memory note below. This is the
+    # single most important flag. Root auth is auto-enabled by the env vars above.
+    command: ["mongod", "--wiredTigerCacheSizeGB", "1.0"]
+    healthcheck:
+      # `ping` doesn't require auth, so no credentials needed here. mongosh ships in the image.
+      test: ["CMD-SHELL", "mongosh --quiet --eval \"db.adminCommand('ping').ok\" | grep -q 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
