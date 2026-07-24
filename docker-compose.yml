@@ -173,6 +173,7 @@ services:
     restart: unless-stopped
     networks:
       - db_net
+      - dokploy-network
     ports:
       - "127.0.0.1:27017:27017"
     volumes:

@@ -1,8 +1,8 @@
 # navexra-infra
 
-Self-hosted infrastructure stack: PostgreSQL + Redis, and a personal **LLM
-gateway** that exposes your Claude, ChatGPT, and Cursor *subscriptions* as a
-single OpenAI-compatible API.
+Self-hosted infrastructure stack: PostgreSQL + Redis + MongoDB (single-node
+replica set), and a personal **LLM gateway** that exposes your Claude,
+ChatGPT, and Cursor *subscriptions* as a single OpenAI-compatible API.
 
 ```
                         ┌─────────────────────────────────────┐
@@ -23,8 +23,8 @@ single OpenAI-compatible API.
 ```
 
 All ports bind to `127.0.0.1` only. Two compose projects share this repo:
-`docker-compose.yml` (databases) and `docker-compose.llm.yml` (gateway,
-project name `navexra-llm`).
+`docker-compose.yml` (databases — Postgres, Redis, MongoDB) and
+`docker-compose.llm.yml` (gateway, project name `navexra-llm`).
 
 > **Terms of service.** Driving consumer Claude/ChatGPT subscriptions from a
 > server is a gray area — keep usage strictly single-user and low-volume.
@@ -278,7 +278,7 @@ master key login) — restrict it by IP in nginx if you prefer.
 ## 8. Repo map
 
 ```
-docker-compose.yml        postgres + redis (project: navexra-infra)
+docker-compose.yml        postgres + redis + mongodb (project: navexra-infra)
 docker-compose.llm.yml    litellm + claude-wrapper + codex-adapter (+cursor, +ollama) (project: navexra-llm)
 docker-compose.n8n.yml    n8n automation (see docs/ADD_N8N.md)
 llm/litellm-config.yaml   model routing table
@@ -287,5 +287,207 @@ llm/cursor-adapter/       Cursor-subscription adapter (FastAPI + cursor-agent)
 scripts/bootstrap-db.sh   create litellm + merchant_api DBs (idempotent)
 scripts/smoke-test.sh     end-to-end health + real completion tests
 docs/                     ADD_LLM.md, ADD_CHATGPT.md, ADD_N8N.md, ADD_NGINX.md
+```
+
+---
+
+## 9. MongoDB single-node replica set — setup reference
+
+One-time setup after `docker compose up`. Needed so MongoDB transactions work
+(permanent fix for *“transaction numbers are only allowed on a replica set
+member”*). Keep this section for reference after the first successful initiate.
+
+### Why this is needed
+
+- MongoDB transactions only work on a replica set, not on standalone.
+- We do not need redundancy — only transactions — so we run a **single-node**
+  replica set (one member that is its own primary).
+- With replica set + auth enabled, MongoDB requires an internal **keyFile**
+  even for a single node.
+
+### One-time prerequisites (first time only)
+
+#### 1. Create the keyfile
+
+Compose mounts files; it cannot create the keyfile. Run once on the host:
+
+```bash
+mkdir -p /root/scripts/mongo
+openssl rand -base64 756 > /root/scripts/mongo/keyfile
+chmod 400 /root/scripts/mongo/keyfile
+chown 999:999 /root/scripts/mongo/keyfile
+```
+
+`999` is the `mongodb` user UID inside the container. Wrong owner or looser
+permissions will prevent Mongo from starting.
+
+#### 2. Compose service (already in `docker-compose.yml`)
+
+Key pieces: keyfile volume mount, `dokploy-network`, and `mongod` in replica-set mode:
+
+```yaml
+mongodb:
+  image: mongo:8.0.26
+  container_name: mongodb
+  restart: unless-stopped
+  networks:
+    - db_net
+    - dokploy-network            # required if apps on Dokploy need Mongo
+  ports:
+    - "127.0.0.1:27017:27017"
+  volumes:
+    - mongo_data:/data/db
+    - /root/scripts/mongo/keyfile:/etc/mongo-keyfile:ro
+  environment:
+    MONGO_INITDB_ROOT_USERNAME: ${MONGO_USER:?...}
+    MONGO_INITDB_ROOT_PASSWORD: ${MONGO_PASSWORD:?...}
+    MONGO_INITDB_DATABASE: ${MONGO_DB:?...}
+  command:
+    - mongod
+    - --replSet
+    - rs0
+    - --keyFile
+    - /etc/mongo-keyfile
+    - --bind_ip_all
+    - --wiredTigerCacheSizeGB
+    - "1.0"
+```
+
+### Steps after `docker compose up` (every fresh setup)
+
+#### Step 1 — Start the container
+
+```bash
+cd /root/infra/navexra-infra        # where the compose file lives
+docker compose up -d mongodb
+docker logs mongodb --tail 20
+```
+
+**Expect:** container healthy. Logs may show *“No primary exists currently”*
+and *“oplog.rs not found”* — normal until initiate (Step 3).
+
+If you see a keyfile permission error:
+
+```bash
+chmod 400 /root/scripts/mongo/keyfile
+chown 999:999 /root/scripts/mongo/keyfile
+docker compose up -d --force-recreate mongodb
+```
+
+#### Step 2 — Load credentials into the shell
+
+```bash
+export MONGO_USER=$(docker exec mongodb printenv MONGO_INITDB_ROOT_USERNAME)
+export MONGO_PASSWORD=$(docker exec mongodb printenv MONGO_INITDB_ROOT_PASSWORD)
+```
+
+If `${MONGO_USER}` is empty, auth fails (`Command replSetInitiate requires
+authentication`). Always export these, or paste the values directly.
+
+#### Step 3 — Initiate the replica set (enables transactions)
+
+```bash
+docker exec -it mongodb mongosh -u "$MONGO_USER" -p "$MONGO_PASSWORD" \
+  --authenticationDatabase admin \
+  --eval 'rs.initiate({_id:"rs0", members:[{_id:0, host:"mongodb:27017"}]})'
+```
+
+**Expect:** `{ ok: 1 }`.
+
+Use host `mongodb:27017` — **not** `localhost`. That hostname is what the
+replica set advertises and what apps resolve.
+
+#### Step 4 — Confirm primary
+
+```bash
+sleep 5
+docker exec mongodb mongosh -u "$MONGO_USER" -p "$MONGO_PASSWORD" \
+  --authenticationDatabase admin --quiet --eval 'rs.status().myState'
+```
+
+**Expect:** `1` (PRIMARY). Then check logs — *oplog.rs not found* should be gone:
+
+```bash
+docker logs mongodb --tail 15
+```
+
+#### Step 5 — Attach to `dokploy-network` (if the app runs on Dokploy)
+
+Otherwise the app cannot resolve hostname `mongodb` (Mongoose
+*Unable to connect… Retrying* / `getaddrinfo ENOTFOUND`).
+
+```bash
+docker network connect dokploy-network mongodb 2>/dev/null || true
+docker inspect mongodb \
+  --format '{{range $k,$v := .NetworkSettings.Networks}}{{$k}} {{end}}'
+```
+
+**Expect:** both `db_net` and `dokploy-network`.
+
+`docker network connect` survives reboot/stop-start, but is lost after
+`docker compose down && up`. Prefer listing `- dokploy-network` in compose
+(already done in this repo).
+
+#### Step 6 — App connection string
+
+In the Dokploy service Environment tab:
+
+```text
+MONGODB_URL=mongodb://<USER>:<PASS>@mongodb:27017/<dbname>?authSource=admin&replicaSet=rs0
+```
+
+Required:
+
+- `&replicaSet=rs0` — without it, transactions still fail
+- `authSource=admin` — root user lives in the admin DB
+- Percent-encode special characters in the password (`@` → `%40`, `#` → `%23`,
+  `/` → `%2F`, `:` → `%3A`)
+- Quote the full URL so `&` is not broken by shell/env parsers
+
+Then redeploy the app.
+
+#### Step 7 — Verify app connectivity
+
+```bash
+docker ps | grep -i <app-name>
+docker exec <app_container_id> getent hosts mongodb
+# Expect: an IP returned = name resolves
+```
+
+Optional transaction smoke test:
+
+```bash
+docker exec mongodb mongosh -u "$MONGO_USER" -p "$MONGO_PASSWORD" \
+  --authenticationDatabase admin --quiet --eval \
+  'const s=db.getMongo().startSession(); s.startTransaction(); s.getDatabase("test").t.insertOne({x:1}); s.commitTransaction(); print("transaction OK")'
+# Expect: transaction OK
+```
+
+### Quick reference — later status checks
+
+```bash
+# Replica set state (1 = primary)
+docker exec mongodb mongosh -u USER -p PASS --authenticationDatabase admin --quiet --eval 'rs.status().myState'
+
+# Full status
+docker exec mongodb mongosh -u USER -p PASS --authenticationDatabase admin --eval 'rs.status()'
+
+# Oplog / replication info
+docker exec mongodb mongosh -u USER -p PASS --authenticationDatabase admin --quiet --eval 'rs.printReplicationInfo()'
+
+# Networks
+docker inspect mongodb --format '{{range $k,$v := .NetworkSettings.Networks}}{{$k}} {{end}}'
+```
+
+### Troubleshooting
+
+
+| Symptom | Fix |
+| ------- | --- |
+| `Command replSetInitiate requires authentication` | `${MONGO_USER}` / `${MONGO_PASSWORD}` were empty — run Step 2 exports |
+| `No primary exists` / `oplog.rs not found` in logs | Normal until `rs.initiate()` — do Step 3 |
+| App: `Unable to connect to the database. Retrying...` (Mongoose) | Network gap — Step 5 (`dokploy-network`); URL must include `&replicaSet=rs0` (Step 6) |
+| keyfile permission error on startup | `chmod 400` + `chown 999:999` keyfile, then `--force-recreate` |
+| yaml: `mapping key 'test' already defined` | Duplicate healthcheck/block in compose — remove one; validate with `docker compose config` |
 ```
 
