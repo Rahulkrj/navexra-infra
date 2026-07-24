@@ -208,9 +208,3 @@ services:
       timeout: 5s
       retries: 5
       start_period: 30s
-      # `ping` doesn't require auth, so no credentials needed here. mongosh ships in the image.
-      test: ["CMD-SHELL", "mongosh --quiet --eval \"db.adminCommand('ping').ok\" | grep -q 1"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-      start_period: 30s
