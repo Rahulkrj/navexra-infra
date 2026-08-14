@@ -45,6 +45,7 @@ services:
       TZ: ${N8N_TIMEZONE:-UTC}
       N8N_DIAGNOSTICS_ENABLED: "false"
       N8N_HIRING_BANNER_ENABLED: "false"
+      NODE_FUNCTION_ALLOW_BUILTIN: crypto	
     stop_grace_period: 30s
     logging:
       driver: json-file
