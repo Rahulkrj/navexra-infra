@@ -3,42 +3,86 @@
 #  SETUP (ek baar chalao, pbm-agent container up hone ke baad)
 #  Percona Backup for MongoDB (PBM) — dedicated Mongo user + storage (R2) +
 #  PITR + scheduled base backups.
-#  Neeche CONFIG bharein, phir: bash setup-pbm.sh
+#
+#  No secrets pasted here. Everything is auto-detected from stuff that
+#  already exists on this VPS:
+#    - R2 access key/secret/endpoint  <- ~/.config/rclone/rclone.conf [r2]
+#      (written by setup-r2.sh — nothing new to type in)
+#    - R2 bucket name                 <- backup-to-r2.sh's R2_BUCKET= line
+#    - Mongo root user/pass           <- `docker exec mongodb printenv ...`
+#      (same auto-detect trick backup-to-r2.sh already uses)
+#    - PBM_MONGO_USER/PASSWORD        <- .env (has to live there anyway —
+#      docker-compose.yml requires it for the pbm-agent service, same as
+#      the existing MONGO_USER/MONGO_PASSWORD)
+#
+#  Only CONFIG left below is non-secret behavior knobs (schedule, retention,
+#  prefix) and the auto-detect source paths, in case your layout differs.
+#
+#  Run: bash setup-pbm.sh
 # =============================================================================
 set -euo pipefail
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  CONFIG
-# ─────────────────────────────────────────────────────────────────────────────
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-# --- R2 (same account/bucket jo setup-r2.sh mein use kiya tha) ---
-R2_ACCESS_KEY="PASTE_ACCESS_KEY_HERE"      # verify: iska scope PBM_PREFIX par likhne ki ijaazat de
-R2_SECRET_KEY="PASTE_SECRET_KEY_HERE"
-R2_ACCOUNT_ID="PASTE_ACCOUNT_ID_HERE"
-R2_BUCKET="PASTE_BUCKET_NAME_HERE"          # wahi bucket jo setup-r2.sh mein tha
-PBM_PREFIX="pbm"                             # naya folder — legacy "backups/" se alag
+# ─────────────────────────────────────────────────────────────────────────────
+#  CONFIG — mostly just paths + non-secret knobs
+# ─────────────────────────────────────────────────────────────────────────────
+RCLONE_CONF="${HOME}/.config/rclone/rclone.conf"       # setup-r2.sh ne yahan likha tha
+BACKUP_SCRIPT="${SCRIPT_DIR}/backup-to-r2.sh"           # R2_BUCKET yahan se padhenge
+ENV_FILE="${SCRIPT_DIR}/../.env"                        # PBM_MONGO_USER/PASSWORD yahan se
 
-# --- Container names ---
 MONGO_CONTAINER="mongodb"
 PBM_CONTAINER="pbm-agent"
 
-# --- Mongo root creds (sirf ek baar, naya PBM user banane ke liye use honge) ---
-MONGO_ROOT_USER="PASTE_MONGO_ROOT_USER_HERE"
-MONGO_ROOT_PASS="PASTE_MONGO_ROOT_PASS_HERE"
-
-# --- Naya dedicated PBM user — .env ke PBM_MONGO_USER/PBM_MONGO_PASSWORD se match hona chahiye ---
-PBM_MONGO_USER="PASTE_PBM_MONGO_USER_HERE"
-PBM_MONGO_PASS="PASTE_PBM_MONGO_PASS_HERE"
-
-# --- PITR + backup schedule ---
-PITR_OPLOG_SPAN_MIN="1"        # chunk-flush interval; isse tight RPO milta hai (minutes mein)
-BASE_BACKUP_CRON="0 2 * * *"   # daily 02:00 UTC — off-peak hour, zaroorat ho to badlein
-RETENTION_KEEP="7"             # last 7 base backups (+ unki oplog chains) rakho
+PBM_PREFIX="pbm"                             # naya folder — legacy "backups/" se alag
+PITR_OPLOG_SPAN_MIN="1"                      # chunk-flush interval; isse tight RPO milta hai (minutes mein)
+BASE_BACKUP_CRON="0 2 * * *"                 # daily 02:00 UTC — off-peak hour, zaroorat ho to badlein
+RETENTION_KEEP="7"                           # last 7 base backups (+ unki oplog chains) rakho
 # =============================================================================
 
 die(){ echo "❌ $*" >&2; exit 1; }
 
-[ "$R2_ACCESS_KEY" = "PASTE_ACCESS_KEY_HERE" ] && die "CONFIG bharein pehle."
+# -- auto-detect: R2 creds from rclone.conf's [r2] section --
+rclone_get(){
+  local key="$1"
+  awk -v k="$key" '
+    /^\[r2\]/ { insec=1; next }
+    /^\[/     { insec=0 }
+    insec {
+      line=$0
+      split(line, parts, "=")
+      gsub(/^[ \t]+|[ \t]+$/, "", parts[1])
+      if (parts[1]==k) { sub(/^[^=]*=[ \t]*/, "", line); print line; exit }
+    }
+  ' "$RCLONE_CONF"
+}
+
+[ -f "$RCLONE_CONF" ] || die "rclone.conf nahi mila ($RCLONE_CONF) — pehle setup-r2.sh chalao."
+R2_ACCESS_KEY=$(rclone_get access_key_id)
+R2_SECRET_KEY=$(rclone_get secret_access_key)
+R2_ENDPOINT=$(rclone_get endpoint)
+[ -n "$R2_ACCESS_KEY" ] && [ -n "$R2_SECRET_KEY" ] && [ -n "$R2_ENDPOINT" ] \
+  || die "rclone.conf ke [r2] section se access_key_id/secret_access_key/endpoint nahi padh paye."
+
+# -- auto-detect: bucket name from backup-to-r2.sh --
+[ -f "$BACKUP_SCRIPT" ] || die "backup-to-r2.sh nahi mila ($BACKUP_SCRIPT)."
+R2_BUCKET=$(grep -E '^R2_BUCKET=' "$BACKUP_SCRIPT" | head -1 | sed -E 's/^R2_BUCKET="?([^"]*)"?.*/\1/')
+[ -n "$R2_BUCKET" ] && [ "$R2_BUCKET" != "PASTE_BUCKET_NAME_HERE" ] \
+  || die "R2_BUCKET backup-to-r2.sh mein set nahi mila — pehle ye file configure karo."
+
+# -- auto-detect: Mongo root creds from the running container's own env --
+MONGO_ROOT_USER=$(docker exec "$MONGO_CONTAINER" printenv MONGO_INITDB_ROOT_USERNAME 2>/dev/null)
+MONGO_ROOT_PASS=$(docker exec "$MONGO_CONTAINER" printenv MONGO_INITDB_ROOT_PASSWORD 2>/dev/null)
+[ -n "$MONGO_ROOT_USER" ] && [ -n "$MONGO_ROOT_PASS" ] \
+  || die "Mongo root creds container se nahi mile — '$MONGO_CONTAINER' chal raha hai aur sahi env hai?"
+
+# -- auto-detect: dedicated PBM user from .env (must match docker-compose.yml) --
+[ -f "$ENV_FILE" ] || die ".env nahi mila ($ENV_FILE)."
+env_get(){ grep -E "^$1=" "$ENV_FILE" | head -1 | cut -d'=' -f2-; }
+PBM_MONGO_USER=$(env_get PBM_MONGO_USER)
+PBM_MONGO_PASS=$(env_get PBM_MONGO_PASSWORD)
+[ -n "$PBM_MONGO_USER" ] && [ -n "$PBM_MONGO_PASS" ] \
+  || die "PBM_MONGO_USER/PBM_MONGO_PASSWORD .env mein nahi mile — pehle wahan add karo (docker-compose.yml ko bhi chahiye)."
 
 echo "[1/5] Dedicated PBM Mongo user bana rahe hain (agar already nahi hai)..."
 # NOTE: ye role-set PBM docs (https://docs.percona.com/percona-backup-mongodb/)
@@ -66,7 +110,7 @@ storage:
     region: auto
     bucket: ${R2_BUCKET}
     prefix: ${PBM_PREFIX}
-    endpointUrl: https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com
+    endpointUrl: ${R2_ENDPOINT}
     credentials:
       access-key-id: ${R2_ACCESS_KEY}
       secret-access-key: ${R2_SECRET_KEY}
