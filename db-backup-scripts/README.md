@@ -107,42 +107,54 @@ backup. RPO is roughly the PITR chunk span (default 1 minute, see `setup-pbm.sh`
 
 1. Bring up the new service: `docker compose up -d pbm-agent` (needs `PBM_MONGO_USER` /
    `PBM_MONGO_PASSWORD` in `.env` first — see `.env.example`).
-2. Fill in the CONFIG block at the top of `setup-pbm.sh` (R2 details — same account as
-   `setup-r2.sh`, just a different prefix; Mongo root creds; the PBM user creds from step 1).
-3. Run it: `bash setup-pbm.sh`. This creates the dedicated least-privilege Mongo user, configures
-   PBM's S3/R2 storage + PITR + the daily backup schedule, and prints the current oplog window so
-   you can judge whether it needs resizing (see the script's own output for the exact command).
-4. Confirm: `docker exec pbm-agent pbm status` should show PITR as running and, after the first
-   scheduled run, a successful base backup.
+2. Run `bash setup-pbm.sh` — no secrets to fill in, it auto-detects everything (R2 creds from
+   `rclone.conf`, bucket from `backup-to-r2.sh`, Mongo root creds from the container, PBM user
+   from `.env`). This creates the dedicated least-privilege Mongo user, configures PBM's S3/R2
+   storage + PITR, sets the retention policy, and **generates `pbm-daily-backup.sh`** next to it
+   — add the crontab line it prints (PBM has no built-in scheduler; it explicitly recommends host
+   cron + `pbm backup`, so that's what this generated script does).
+3. Run `bash pbm-daily-backup.sh` once manually — PITR won't actually start producing chunks
+   until a base backup exists.
+4. Confirm: `docker exec pbm-agent pbm status` should show PITR `[ON]` with no error, and a
+   snapshot listed under Backups with `status: done`.
 
 ### MongoDB restore (PBM / point-in-time)
 
 ```bash
-# Restore to the latest available point:
-docker exec pbm-agent pbm restore --base-snapshot=<name>   # or just: pbm restore --time=<latest>
-
-# Restore to a specific point in time (point-in-time recovery):
-docker exec pbm-agent pbm restore --time="2026-10-02T03:15:00"
-
 # List available restore points first:
 docker exec pbm-agent pbm status
 docker exec pbm-agent pbm list
+
+# Full restore to the latest snapshot (IN PLACE — overwrites the live database):
+docker exec pbm-agent pbm restore <snapshot-name> --yes
+
+# Point-in-time restore (also IN PLACE):
+docker exec pbm-agent pbm restore --time="2026-10-02T03:15:00" --yes
 ```
-PBM restores in place by default (into the same replica set) — for a non-destructive test into a
-scratch namespace, use the `--ns`/remap options documented by `pbm restore --help` for your
-installed version (flag names have changed across PBM major versions; verify before using in prod).
+**PBM restores in place by default** — there is no wildcard/whole-database "restore into a
+different name" option (confirmed against the real CLI: `--ns-from`/`--ns-to` only clone a single
+named collection, not `db.*`). For a non-destructive test without touching the live database, use
+`--ns-from`/`--ns-to` **per collection**, into a scratch db name:
+```bash
+docker exec pbm-agent pbm restore --time="2026-10-02T03:15:00" \
+  --ns-from="reportify.patients" --ns-to="restoretest.patients" --yes
+```
+Repeat the `--ns-from`/`--ns-to` pair once per collection you want to check. This only works
+within the *same* cluster the backup came from — PBM matches backups/PITR chunks to a replica
+set's internal identity, not just its name, so restoring into a separate/fresh replica set (even
+one named `rs0` too) does not make PITR chunks visible there; only a full named-snapshot restore
+works cross-cluster, which is the right tool for genuine disaster recovery onto new
+infrastructure, not for a safe same-cluster test.
 
 ### Monthly restore test — MongoDB (PBM / PITR)
 
-Mirror the existing Postgres/legacy-Mongo discipline below, but proving PITR specifically (not
-just "a backup exists"):
-
 1. Pick a timestamp from the last few hours (not "latest" — the point is to prove you can land on
    an arbitrary moment, which is the whole value of PITR over discrete dumps).
-2. Restore into a scratch environment per `pbm restore --help`'s namespace-remap flags for your
-   PBM version (same spirit as the legacy `--nsFrom/--nsTo` pattern below).
-3. Confirm document counts/content match what you'd expect as of that timestamp.
-4. Clean up the scratch database.
+2. Pick 1-2 representative collections and restore each with `--ns-from`/`--ns-to` into a
+   `restoretest` scratch db, as above.
+3. Confirm document counts/content match what you'd expect as of that timestamp, and that the
+   live collections were untouched.
+4. Clean up: `docker exec mongodb mongosh ... --eval 'db.getSiblingDB("restoretest").dropDatabase()'`
 
 ### Health monitoring
 
