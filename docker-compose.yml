@@ -4,7 +4,12 @@
 #  Existing services (assumed): ~1 vCPU / 3 GB
 #  PostgreSQL:  0.6 vCPU / 2 GB
 #  Redis:       0.3 vCPU / 512 MB
+#  MongoDB:     0.5 vCPU / 2 GB
+#  pbm-agent:   0.15 vCPU / 256 MB  (mostly idle; briefly busier during backups)
 #  OS + Nginx:  ~0.1 vCPU / headroom
+#  NOTE: limits below already sum past 2 vCPU on paper — these are soft
+#  `deploy.resources.limits`, not reservations, so some overcommit is normal,
+#  but keep new additions (like pbm-agent) as lean as possible.
 # ─────────────────────────────────────────────
 #
 # Notes:
@@ -45,6 +50,9 @@ services:
     restart: unless-stopped
     networks:
       - db_net
+      # ADD: lets Dokploy-managed swarm services (e.g. the-sell-point backend)
+      # resolve this container as `postgres` — same pattern as `mongodb` below.
+      - dokploy-network
     ports:
       - "127.0.0.1:5432:5432"
     volumes:
@@ -209,3 +217,34 @@ services:
       timeout: 5s
       retries: 5
       start_period: 30s
+
+  # ───────────────────────────────────────────
+  #  pbm-agent — Percona Backup for MongoDB
+  #  Notes:
+  #   One-time setup after first `up`: create the PBM_MONGO_USER in Mongo and
+  #   run `pbm config`/`pbm config --set pitr.enabled=true` — see
+  #   db-backup-scripts/setup-pbm.sh. No local persistent volume needed: PBM
+  #   streams straight to remote (R2/S3) storage and keeps its own metadata
+  #   inside the replica set.
+  # ───────────────────────────────────────────
+  pbm-agent:
+    image: percona/percona-backup-mongodb:2
+    container_name: pbm-agent
+    restart: unless-stopped
+    depends_on:
+      mongodb:
+        condition: service_healthy
+    networks:
+      - db_net
+    environment:
+      PBM_MONGODB_URI: "mongodb://${PBM_MONGO_USER:?PBM_MONGO_USER is required}:${PBM_MONGO_PASSWORD:?PBM_MONGO_PASSWORD is required}@mongodb:27017/?authSource=admin&replicaSet=rs0"
+    stop_grace_period: 30s
+    logging: *default-logging
+    deploy:
+      resources:
+        limits:
+          cpus: "0.15"
+          memory: 256M
+        reservations:
+          cpus: "0.02"
+          memory: 64M
