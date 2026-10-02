@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
 # =============================================================================
-#  BACKUP  —  MongoDB (saari DB) + PostgreSQL (saara server)  ->  local  ->  R2
+#  BACKUP  —  PostgreSQL (saara server)  ->  local  ->  R2
+#  MongoDB ab isse backup nahi hota — Percona Backup for MongoDB (PBM) use
+#  hota hai, see db-backup-scripts/README.md "MongoDB backups (PBM)" section.
 #  Cron ke liye. Ek baar setup-r2.sh chal chuka hona chahiye.
 #  Test:  bash backup-to-r2.sh
 # =============================================================================
-set -uo pipefail   # -e nahi: ek DB fail ho to doosre ka backup phir bhi ho
+set -uo pipefail   # -e nahi: DB fail ho to bhi R2 upload/cleanup chalta rahe
 
 # cron ka PATH chhota hota hai — docker/rclone dhundhne ke liye:
 export PATH="/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:$PATH"
@@ -14,11 +16,9 @@ export PATH="/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:$PATH"
 # -----------------------------------------------------------------------------
 
 # --- Kya-kya backup karna hai? (true/false) ---
-BACKUP_MONGO="true"
 BACKUP_POSTGRES="true"
 
 # --- Container names (docker ps se) ---
-MONGO_CONTAINER="mongodb"
 PG_CONTAINER="postgres"
 
 # --- R2 ---
@@ -31,8 +31,6 @@ KEEP_LOCAL_DAYS=3      # local mein itne din rakho
 KEEP_R2_DAYS=30        # R2 par itne din rakho (offsite)
 
 # Credentials khaali chhodenge to container se auto-detect (recommended)
-MONGO_USER=""
-MONGO_PASS=""
 PG_USER=""
 PG_PASS=""
 
@@ -46,28 +44,6 @@ FAILED=0
 
 log(){ echo "[$(date +%H:%M:%S)] $*"; }
 warn(){ echo "WARN: $*" >&2; FAILED=1; }
-
-# -- MongoDB backup (saari databases) --
-if [ "$BACKUP_MONGO" = "true" ]; then
-  log "Mongo backup shuru..."
-  MU=${MONGO_USER:-$(docker exec "$MONGO_CONTAINER" printenv MONGO_INITDB_ROOT_USERNAME 2>/dev/null)}
-  MP=${MONGO_PASS:-$(docker exec "$MONGO_CONTAINER" printenv MONGO_INITDB_ROOT_PASSWORD 2>/dev/null)}
-  MFILE="$LOCAL_DIR/mongo_${STAMP}.archive"
-
-  if docker exec "$MONGO_CONTAINER" mongodump \
-        -u "$MU" -p "$MP" --authenticationDatabase admin \
-        --archive=/tmp/m_${STAMP}.archive --gzip 2>/tmp/mongo_err.log; then
-    docker cp "${MONGO_CONTAINER}:/tmp/m_${STAMP}.archive" "$MFILE"
-    docker exec "$MONGO_CONTAINER" rm -f /tmp/m_${STAMP}.archive
-    if [ -s "$MFILE" ]; then
-      log "  Mongo dump OK: $(du -h "$MFILE" | cut -f1)"
-    else
-      warn "Mongo dump khaali nikla."
-    fi
-  else
-    warn "Mongo dump fail: $(tail -1 /tmp/mongo_err.log 2>/dev/null)"
-  fi
-fi
 
 # -- Postgres backup (pg_dumpall = saara server) --
 if [ "$BACKUP_POSTGRES" = "true" ]; then

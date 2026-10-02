@@ -5,10 +5,10 @@ MongoDB ab isi script se backup nahi hota — **Percona Backup for MongoDB (PBM)
 (continuous PITR + daily base backup, same R2 bucket, alag prefix). Dono systems ek hi R2
 account/bucket share karte hain, bas alag-alag prefix mein.
 
-> **Status note (add this once the cutover below is actually applied):** until `backup-to-r2.sh`
-> has the Mongo block removed, it is STILL also dumping Mongo every 4h in parallel with PBM —
-> that overlap is intentional and temporary, see "Cutover" section at the bottom. Do not remove
-> it until the PBM validation gate has passed.
+> **Status: cutover complete (2026-10-03).** `backup-to-r2.sh` no longer dumps Mongo — PBM is the
+> sole system of record for Mongo backups, validated live on production first (test restore +
+> staleness alert, see "MongoDB backups (PBM)" below). See "Cutover" section at the bottom for
+> the record of what changed and when.
 
 ---
 
@@ -67,7 +67,6 @@ bash backup-to-r2.sh
 ```
 EXPECT:
 ```
-Mongo dump OK: 27M
 Postgres dump OK: <size>
 R2 upload OK
 OK Backup complete - local + R2 dono OK
@@ -293,8 +292,10 @@ rclone size r2:<BUCKET>/backups/
 | `database "reportify" does not exist` | `pg_dump -d` ka issue tha. Ab `pg_dumpall` use hota hai — naam ki zaroorat nahi. |
 | `docker: command not found` (cron mein) | Cron ka PATH chhota. Script ke top par `export PATH=...` line hai — wahi fix hai. |
 | `R2 upload FAIL` | rclone config / bucket naam / credentials check. `rclone lsd r2:` se test. |
-| Mongo dump khaali | Container naam ya credentials galat. `docker exec mongodb printenv MONGO_INITDB_ROOT_USERNAME` |
 | Postgres auth fail | Superuser ka naam `pguser` hai (not `postgres`). Auto-detect isko handle karta hai. |
+
+For Mongo/PBM troubleshooting, see the "MongoDB backups (PBM)" section above — this script no
+longer touches Mongo at all.
 
 ---
 
@@ -314,20 +315,18 @@ rclone size r2:<BUCKET>/backups/
 
 ---
 
-## Cutover: removing Mongo from `backup-to-r2.sh` (do this LAST, not now)
+## Cutover: Mongo removed from `backup-to-r2.sh` (done 2026-10-03)
 
-Once — and only once — the PBM monthly restore test above has actually been run successfully and
-the Telegram alert has been verified to fire on an artificial staleness test, retire the Mongo
-side of this script so there's one system of record for Mongo backups, not two running in
-parallel indefinitely:
+The PBM validation gate (monthly-style restore test + artificial staleness alert) was run live on
+production first — see "MongoDB backups (PBM)" above — and passed before this cutover happened,
+per this project's "one system of record, not two running in parallel" decision. What changed:
 
-1. In `backup-to-r2.sh`, set `BACKUP_MONGO="false"` (or delete the whole "MongoDB backup" `if`
-   block — either works; deleting is cleaner long-term). Leave `BACKUP_POSTGRES="true"` and
-   everything below it untouched — Postgres keeps running on this exact script/schedule.
-2. Re-run the "Test (haath se)" step from above and confirm the output no longer mentions Mongo
-   but still shows `Postgres dump OK` and `R2 upload OK`.
-3. Known follow-up (non-blocking): `ReportifyPro/scripts/prune-mongo-backups.sh` and
-   `restore-mongo-backup.sh` assume new `mongo_*` archives keep landing under the legacy R2
-   `backups/` prefix — once this cutover happens they won't. That's fine (the prod→dev sync
-   workflow they supported isn't actively used), but worth cleaning up or repointing at PBM
-   eventually so a future reader doesn't trust a stale script.
+1. `backup-to-r2.sh`'s whole "MongoDB backup" `if` block was deleted (not just disabled via a
+   flag) — `BACKUP_POSTGRES="true"` and everything below it is untouched, same schedule.
+2. Confirmed via the "Test (haath se)" step: output no longer mentions Mongo, still shows
+   `Postgres dump OK` and `R2 upload OK`.
+3. **Known follow-up (non-blocking):** `ReportifyPro/scripts/prune-mongo-backups.sh` and
+   `restore-mongo-backup.sh` assumed new `mongo_*` archives would keep landing under the legacy R2
+   `backups/` prefix — they won't anymore. That's fine (the prod→dev sync workflow they supported
+   isn't actively used), but worth cleaning up or repointing at PBM eventually so a future reader
+   doesn't trust a stale script.
