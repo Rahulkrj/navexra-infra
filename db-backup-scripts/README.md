@@ -19,7 +19,7 @@ account/bucket share karte hain, bas alag-alag prefix mein.
 | PostgreSQL | `backup-to-r2.sh`, saara server (`pg_dumpall`), har 4 ghante, local `/root/backups` + R2 `backups/` prefix |
 | MongoDB | **PBM** — continuous PITR (oplog, ~1 min chunks) + daily base backup, R2 `pbm/` prefix (see "MongoDB backups (PBM)" section below) |
 | Local retention (Postgres) | 3 din |
-| R2 retention (Postgres) | 30 din |
+| R2 retention (Postgres) | 7 din |
 | R2 retention (Mongo/PBM) | 7 din (configured via `setup-pbm.sh`) |
 | Server time | UTC |
 

@@ -28,7 +28,7 @@ R2_PREFIX="backups"                     # bucket ke andar folder
 # --- Local storage + retention ---
 LOCAL_DIR="/root/backups"
 KEEP_LOCAL_DAYS=3      # local mein itne din rakho
-KEEP_R2_DAYS=30        # R2 par itne din rakho (offsite)
+KEEP_R2_DAYS=7         # R2 par itne din rakho (offsite)
 
 # Credentials khaali chhodenge to container se auto-detect (recommended)
 PG_USER=""
