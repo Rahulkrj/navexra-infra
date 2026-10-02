@@ -5,10 +5,10 @@ MongoDB ab isi script se backup nahi hota — **Percona Backup for MongoDB (PBM)
 (continuous PITR + daily base backup, same R2 bucket, alag prefix). Dono systems ek hi R2
 account/bucket share karte hain, bas alag-alag prefix mein.
 
-> **Status note (add this once the cutover below is actually applied):** until `backup-to-r2.sh`
-> has the Mongo block removed, it is STILL also dumping Mongo every 4h in parallel with PBM —
-> that overlap is intentional and temporary, see "Cutover" section at the bottom. Do not remove
-> it until the PBM validation gate has passed.
+> **Status: cutover complete (2026-10-03).** `backup-to-r2.sh` no longer dumps Mongo — PBM is the
+> sole system of record for Mongo backups, validated live on production first (test restore +
+> staleness alert, see "MongoDB backups (PBM)" below). See "Cutover" section at the bottom for
+> the record of what changed and when.
 
 ---
 
@@ -67,7 +67,6 @@ bash backup-to-r2.sh
 ```
 EXPECT:
 ```
-Mongo dump OK: 27M
 Postgres dump OK: <size>
 R2 upload OK
 OK Backup complete - local + R2 dono OK
@@ -107,42 +106,78 @@ backup. RPO is roughly the PITR chunk span (default 1 minute, see `setup-pbm.sh`
 
 1. Bring up the new service: `docker compose up -d pbm-agent` (needs `PBM_MONGO_USER` /
    `PBM_MONGO_PASSWORD` in `.env` first — see `.env.example`).
-2. Fill in the CONFIG block at the top of `setup-pbm.sh` (R2 details — same account as
-   `setup-r2.sh`, just a different prefix; Mongo root creds; the PBM user creds from step 1).
-3. Run it: `bash setup-pbm.sh`. This creates the dedicated least-privilege Mongo user, configures
-   PBM's S3/R2 storage + PITR + the daily backup schedule, and prints the current oplog window so
-   you can judge whether it needs resizing (see the script's own output for the exact command).
-4. Confirm: `docker exec pbm-agent pbm status` should show PITR as running and, after the first
-   scheduled run, a successful base backup.
+2. Run `bash setup-pbm.sh` — no secrets to fill in, it auto-detects everything (R2 creds from
+   `rclone.conf`, bucket from `backup-to-r2.sh`, Mongo root creds from the container, PBM user
+   from `.env`). This creates the dedicated least-privilege Mongo user, configures PBM's S3/R2
+   storage + PITR, sets the retention policy, and **generates `pbm-daily-backup.sh`** next to it
+   — add the crontab line it prints (PBM has no built-in scheduler; it explicitly recommends host
+   cron + `pbm backup`, so that's what this generated script does).
+3. Run `bash pbm-daily-backup.sh` once manually — PITR won't actually start producing chunks
+   until a base backup exists.
+4. Confirm: `docker exec pbm-agent pbm status` should show PITR `[ON]` with no error, and a
+   snapshot listed under Backups with `status: done`.
 
 ### MongoDB restore (PBM / point-in-time)
 
+> ⚠️ **Any `pbm restore` command disables the PITR oplog slicer as a side effect — even a failed
+> restore — and PBM then REQUIRES a fresh full base backup before PITR will resume, no matter
+> what you set `pitr.enabled` to.** Confirmed on this project's VPS (2026-10-03), two-stage: a
+> restore attempt silently killed PITR; toggling `pitr.enabled=false`/`true` looked like it fixed
+> it (`pbm status` showed `[ON]`, chunks even seemed to continue for a while), but after the
+> `pbm-agent` container was later restarted, `pbm status` revealed the real state: `ERROR while
+> running PITR backup: ... no backup found after the restored <snapshot>, a new backup is
+> required to resume PITR`. **After every restore (test or real), run:**
+> ```bash
+> bash /root/infra/navexra-infra/db-backup-scripts/pbm-daily-backup.sh   # or: docker exec pbm-agent pbm backup --wait
+> sleep 70
+> docker exec pbm-agent pbm status   # must show "Status [ON]" with NO error line
+> docker exec pbm-agent pbm list -o json   # confirm pitr.ranges has a NEW range starting after the backup
+> ```
+> Toggling `pitr.enabled` off/on is not sufficient by itself and can look deceptively fine for a
+> while — the fresh backup is what actually clears the "backup required" condition. Don't trust a
+> clean-looking `pbm status` right after a restore; wait for a real new chunk to confirm it's
+> actually producing data again.
+> Also: if you issue `pbm config --set` within a few seconds of starting a restore, it'll fail with
+> `another operation in progress` — wait for `Currently running: (none)` in `pbm status` first.
+
 ```bash
-# Restore to the latest available point:
-docker exec pbm-agent pbm restore --base-snapshot=<name>   # or just: pbm restore --time=<latest>
-
-# Restore to a specific point in time (point-in-time recovery):
-docker exec pbm-agent pbm restore --time="2026-10-02T03:15:00"
-
 # List available restore points first:
 docker exec pbm-agent pbm status
 docker exec pbm-agent pbm list
+
+# Full restore to the latest snapshot (IN PLACE — overwrites the live database):
+docker exec pbm-agent pbm restore <snapshot-name> --yes
+
+# Point-in-time restore (also IN PLACE):
+docker exec pbm-agent pbm restore --time="2026-10-02T03:15:00" --yes
 ```
-PBM restores in place by default (into the same replica set) — for a non-destructive test into a
-scratch namespace, use the `--ns`/remap options documented by `pbm restore --help` for your
-installed version (flag names have changed across PBM major versions; verify before using in prod).
+**PBM restores in place by default** — there is no wildcard/whole-database "restore into a
+different name" option (confirmed against the real CLI: `--ns-from`/`--ns-to` only clone a single
+named collection, not `db.*`). For a non-destructive test without touching the live database, use
+`--ns-from`/`--ns-to` **per collection**, into a scratch db name:
+```bash
+docker exec pbm-agent pbm restore --time="2026-10-02T03:15:00" \
+  --ns-from="reportify.patients" --ns-to="restoretest.patients" --yes
+```
+Repeat the `--ns-from`/`--ns-to` pair once per collection you want to check. This only works
+within the *same* cluster the backup came from — PBM matches backups/PITR chunks to a replica
+set's internal identity, not just its name, so restoring into a separate/fresh replica set (even
+one named `rs0` too) does not make PITR chunks visible there; only a full named-snapshot restore
+works cross-cluster, which is the right tool for genuine disaster recovery onto new
+infrastructure, not for a safe same-cluster test.
 
 ### Monthly restore test — MongoDB (PBM / PITR)
 
-Mirror the existing Postgres/legacy-Mongo discipline below, but proving PITR specifically (not
-just "a backup exists"):
-
 1. Pick a timestamp from the last few hours (not "latest" — the point is to prove you can land on
    an arbitrary moment, which is the whole value of PITR over discrete dumps).
-2. Restore into a scratch environment per `pbm restore --help`'s namespace-remap flags for your
-   PBM version (same spirit as the legacy `--nsFrom/--nsTo` pattern below).
-3. Confirm document counts/content match what you'd expect as of that timestamp.
-4. Clean up the scratch database.
+2. Pick 1-2 representative collections and restore each with `--ns-from`/`--ns-to` into a
+   `restoretest` scratch db, as above.
+3. Confirm document counts/content match what you'd expect as of that timestamp, and that the
+   live collections were untouched.
+4. **Resume PITR** (see the warning above — restore always disables it and requires a fresh
+   backup, not just a config toggle, to actually resume): run `pbm-daily-backup.sh`, confirm
+   `pbm status` shows no error and a new chunk actually appears after waiting ~70s.
+5. Clean up: `docker exec mongodb mongosh ... --eval 'db.getSiblingDB("restoretest").dropDatabase()'`
 
 ### Health monitoring
 
@@ -257,8 +292,10 @@ rclone size r2:<BUCKET>/backups/
 | `database "reportify" does not exist` | `pg_dump -d` ka issue tha. Ab `pg_dumpall` use hota hai — naam ki zaroorat nahi. |
 | `docker: command not found` (cron mein) | Cron ka PATH chhota. Script ke top par `export PATH=...` line hai — wahi fix hai. |
 | `R2 upload FAIL` | rclone config / bucket naam / credentials check. `rclone lsd r2:` se test. |
-| Mongo dump khaali | Container naam ya credentials galat. `docker exec mongodb printenv MONGO_INITDB_ROOT_USERNAME` |
 | Postgres auth fail | Superuser ka naam `pguser` hai (not `postgres`). Auto-detect isko handle karta hai. |
+
+For Mongo/PBM troubleshooting, see the "MongoDB backups (PBM)" section above — this script no
+longer touches Mongo at all.
 
 ---
 
@@ -278,20 +315,18 @@ rclone size r2:<BUCKET>/backups/
 
 ---
 
-## Cutover: removing Mongo from `backup-to-r2.sh` (do this LAST, not now)
+## Cutover: Mongo removed from `backup-to-r2.sh` (done 2026-10-03)
 
-Once — and only once — the PBM monthly restore test above has actually been run successfully and
-the Telegram alert has been verified to fire on an artificial staleness test, retire the Mongo
-side of this script so there's one system of record for Mongo backups, not two running in
-parallel indefinitely:
+The PBM validation gate (monthly-style restore test + artificial staleness alert) was run live on
+production first — see "MongoDB backups (PBM)" above — and passed before this cutover happened,
+per this project's "one system of record, not two running in parallel" decision. What changed:
 
-1. In `backup-to-r2.sh`, set `BACKUP_MONGO="false"` (or delete the whole "MongoDB backup" `if`
-   block — either works; deleting is cleaner long-term). Leave `BACKUP_POSTGRES="true"` and
-   everything below it untouched — Postgres keeps running on this exact script/schedule.
-2. Re-run the "Test (haath se)" step from above and confirm the output no longer mentions Mongo
-   but still shows `Postgres dump OK` and `R2 upload OK`.
-3. Known follow-up (non-blocking): `ReportifyPro/scripts/prune-mongo-backups.sh` and
-   `restore-mongo-backup.sh` assume new `mongo_*` archives keep landing under the legacy R2
-   `backups/` prefix — once this cutover happens they won't. That's fine (the prod→dev sync
-   workflow they supported isn't actively used), but worth cleaning up or repointing at PBM
-   eventually so a future reader doesn't trust a stale script.
+1. `backup-to-r2.sh`'s whole "MongoDB backup" `if` block was deleted (not just disabled via a
+   flag) — `BACKUP_POSTGRES="true"` and everything below it is untouched, same schedule.
+2. Confirmed via the "Test (haath se)" step: output no longer mentions Mongo, still shows
+   `Postgres dump OK` and `R2 upload OK`.
+3. **Known follow-up (non-blocking):** `ReportifyPro/scripts/prune-mongo-backups.sh` and
+   `restore-mongo-backup.sh` assumed new `mongo_*` archives would keep landing under the legacy R2
+   `backups/` prefix — they won't anymore. That's fine (the prod→dev sync workflow they supported
+   isn't actively used), but worth cleaning up or repointing at PBM eventually so a future reader
+   doesn't trust a stale script.
