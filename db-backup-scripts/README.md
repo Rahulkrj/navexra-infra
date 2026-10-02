@@ -120,6 +120,24 @@ backup. RPO is roughly the PITR chunk span (default 1 minute, see `setup-pbm.sh`
 
 ### MongoDB restore (PBM / point-in-time)
 
+> ⚠️ **Any `pbm restore` command disables the PITR oplog slicer as a side effect — even a failed
+> restore — and it does NOT automatically resume afterward.** Confirmed on this project's VPS
+> (2026-10-03): a restore attempt silently killed PITR, and it stayed off for ~10 minutes with
+> zero new chunks until this was caught and fixed. **After every restore (test or real), you MUST
+> run:**
+> ```bash
+> docker exec pbm-agent pbm config --set pitr.enabled=false
+> docker exec pbm-agent pbm config --set pitr.enabled=true
+> docker exec pbm-agent pbm status   # confirm "Status [ON]", then wait ~70s and re-check
+> docker exec pbm-agent pbm list -o json   # confirm pitr.ranges has a NEW range starting after your restore
+> ```
+> Setting `pitr.enabled=true` when it's already (nominally) `true` is a no-op — you must toggle it
+> `false` then `true` to force the agent to actually restart the slicer. Don't just trust
+> `pbm status` showing `[ON]` right after a restore — wait for a real new chunk to confirm it's
+> actually producing data again, not just reporting the config flag.
+> Also: if you issue `pbm config --set` within a few seconds of starting a restore, it'll fail with
+> `another operation in progress` — wait for `Currently running: (none)` in `pbm status` first.
+
 ```bash
 # List available restore points first:
 docker exec pbm-agent pbm status
@@ -154,7 +172,9 @@ infrastructure, not for a safe same-cluster test.
    `restoretest` scratch db, as above.
 3. Confirm document counts/content match what you'd expect as of that timestamp, and that the
    live collections were untouched.
-4. Clean up: `docker exec mongodb mongosh ... --eval 'db.getSiblingDB("restoretest").dropDatabase()'`
+4. **Re-enable PITR** (see the warning above — restore always disables it): toggle
+   `pitr.enabled=false` then `true`, confirm a new chunk actually appears after waiting ~70s.
+5. Clean up: `docker exec mongodb mongosh ... --eval 'db.getSiblingDB("restoretest").dropDatabase()'`
 
 ### Health monitoring
 
