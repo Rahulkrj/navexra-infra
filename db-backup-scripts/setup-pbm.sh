@@ -168,7 +168,10 @@ EOF
 chmod +x "$DAILY_BACKUP_SCRIPT"
 echo "   Likha gaya. ADD TO CRONTAB (abhi khud se nahi hua):"
 echo "     crontab -e"
-echo "     0 2 * * * ${DAILY_BACKUP_SCRIPT} >> /var/log/pbm-backup.log 2>&1"
+echo "     0 21 * * * ${DAILY_BACKUP_SCRIPT} >> /var/log/pbm-backup.log 2>&1"
+echo "   (0 21 UTC = 2:30 AM IST — adjust the hour if your off-peak window differs;"
+echo "    this VPS's cron does NOT honor CRON_TZ, confirmed empirically, so this must"
+echo "    be the UTC-equivalent hour, not your local hour)"
 
 echo "[5/6] Oplog window check kar rahe hain..."
 docker exec "$MONGO_CONTAINER" mongosh -u "$MONGO_ROOT_USER" -p "$MONGO_ROOT_PASS" \
