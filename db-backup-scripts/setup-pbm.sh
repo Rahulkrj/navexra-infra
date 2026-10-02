@@ -28,8 +28,16 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 #  CONFIG — mostly just paths + non-secret knobs
 # ─────────────────────────────────────────────────────────────────────────────
 RCLONE_CONF="${HOME}/.config/rclone/rclone.conf"       # setup-r2.sh ne yahan likha tha
-BACKUP_SCRIPT="${SCRIPT_DIR}/backup-to-r2.sh"           # R2_BUCKET yahan se padhenge
 ENV_FILE="${SCRIPT_DIR}/../.env"                        # PBM_MONGO_USER/PASSWORD yahan se
+
+# R2_BUCKET yahan se padhenge — deployed copy (/root/scripts/db-backup/, jahan
+# README.md ke hisaab se cron ke liye real values filled hote hain) ko pehle
+# check karte hain, phir git checkout wali (placeholder-only) copy ko fallback
+# ke taur par, agar layout alag hai.
+BACKUP_SCRIPT_CANDIDATES=(
+  "/root/scripts/db-backup/backup-to-r2.sh"
+  "${SCRIPT_DIR}/backup-to-r2.sh"
+)
 
 MONGO_CONTAINER="mongodb"
 PBM_CONTAINER="pbm-agent"
@@ -64,11 +72,19 @@ R2_ENDPOINT=$(rclone_get endpoint)
 [ -n "$R2_ACCESS_KEY" ] && [ -n "$R2_SECRET_KEY" ] && [ -n "$R2_ENDPOINT" ] \
   || die "rclone.conf ke [r2] section se access_key_id/secret_access_key/endpoint nahi padh paye."
 
-# -- auto-detect: bucket name from backup-to-r2.sh --
-[ -f "$BACKUP_SCRIPT" ] || die "backup-to-r2.sh nahi mila ($BACKUP_SCRIPT)."
-R2_BUCKET=$(grep -E '^R2_BUCKET=' "$BACKUP_SCRIPT" | head -1 | sed -E 's/^R2_BUCKET="?([^"]*)"?.*/\1/')
-[ -n "$R2_BUCKET" ] && [ "$R2_BUCKET" != "PASTE_BUCKET_NAME_HERE" ] \
-  || die "R2_BUCKET backup-to-r2.sh mein set nahi mila — pehle ye file configure karo."
+# -- auto-detect: bucket name from backup-to-r2.sh (deployed copy, not the git placeholder) --
+R2_BUCKET=""
+for candidate in "${BACKUP_SCRIPT_CANDIDATES[@]}"; do
+  [ -f "$candidate" ] || continue
+  found=$(grep -E '^R2_BUCKET=' "$candidate" | head -1 | sed -E 's/^R2_BUCKET="?([^"]*)"?.*/\1/')
+  if [ -n "$found" ] && [ "$found" != "PASTE_BUCKET_NAME_HERE" ]; then
+    R2_BUCKET="$found"
+    echo "   (R2_BUCKET '${R2_BUCKET}' mila: ${candidate})"
+    break
+  fi
+done
+[ -n "$R2_BUCKET" ] \
+  || die "R2_BUCKET kahin nahi mila (checked: ${BACKUP_SCRIPT_CANDIDATES[*]}) — ya to woh file nahi hai ya abhi tak placeholder hai."
 
 # -- auto-detect: Mongo root creds from the running container's own env --
 MONGO_ROOT_USER=$(docker exec "$MONGO_CONTAINER" printenv MONGO_INITDB_ROOT_USERNAME 2>/dev/null)
